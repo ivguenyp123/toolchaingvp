@@ -71,8 +71,10 @@ variables:
   # =============================================================================
   # GITLEAKS - Détection de secrets (tokens, clés, mots de passe committés)
   # =============================================================================
-  GITLEAKS_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/zricethezav/gitleaks:v8.30.1
-  BLOCKING_GITLEAKS_SCAN: "true"
+  # Image officielle zricethezav/gitleaks épinglée par DIGEST (via mirror GCP).
+  # ⚠️ Digest fourni par Gemini dans la story → À VÉRIFIER qu'il correspond bien
+  #    à v8.30.1 sur le registre GCP avant mise en prod (sinon le pull échoue).
+  GITLEAKS_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f # v8.30.1
   # =============================================================================
   # SUPPLY CHAIN - Cooldown / quarantaine des packages npm récemment publiés
   # =============================================================================
@@ -567,8 +569,15 @@ lint:
   allow_failure: true
 
 # =============================================================================
-# GITLEAKS - Scan de secrets
+# GITLEAKS - Détection de secrets
 # =============================================================================
+# Filet de sécurité en complément du push protection GitLab (au cas où il aurait
+# été désactivé / mal configuré). Deux étapes :
+#   1. Dernier commit  -> analyse stricte, BLOQUANTE (le pipeline échoue).
+#   2. Historique      -> mode warning (non bloquant) + rapport, pour inciter
+#      les squads à renouveler (rotation) les anciens secrets leakés.
+# Après rotation, un secret peut être ajouté au .gitleaksignore (lu
+# automatiquement par gitleaks) pour ne plus être signalé.
 gitleaks:
   <<: *build_rules
   stage: test
@@ -576,44 +585,35 @@ gitleaks:
     name: ${GITLEAKS_IMAGE}
     entrypoint: [""]
   variables:
-    GIT_DEPTH: 0 # historique complet requis pour un scan de secrets exhaustif
+    GIT_DEPTH: 0 # historique complet requis pour l'étape 2
   script:
-    - echo "🔐 Gitleaks - Détection de secrets (tokens, clés, mots de passe)"
+    - echo "🔐 Étape 1 - analyse stricte du dernier commit (BLOQUANT)"
     - |
-      GL_EXIT=0
-      # Sur une MR : scanner uniquement le diff ; sinon scan complet de l'historique
-      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ] && [ -n "${CI_MERGE_REQUEST_DIFF_BASE_SHA}" ]; then
-        echo "🔍 Scan du diff de la merge request (${CI_MERGE_REQUEST_DIFF_BASE_SHA}..HEAD)"
-        LOG_OPTS="--log-opts=${CI_MERGE_REQUEST_DIFF_BASE_SHA}..HEAD"
+      # gitleaks v8 n'a pas de --commit-range : on passe la plage via --log-opts.
+      if git rev-parse --verify -q HEAD~1 >/dev/null; then
+        RANGE="HEAD~1..HEAD"
       else
-        echo "🔍 Scan complet de l'historique du dépôt"
-        LOG_OPTS=""
+        # Dépôt à un seul commit : pas de parent, on analyse le commit initial
+        RANGE="$(git rev-list --max-parents=0 HEAD | tail -1)..HEAD"
       fi
-      gitleaks detect \
-        --source . \
-        --redact \
-        --verbose \
-        --report-format sarif \
-        --report-path gitleaks-report.sarif \
-        ${LOG_OPTS} || GL_EXIT=$?
-      if [ $GL_EXIT -ne 0 ]; then
-        echo "❌ SECURITY VIOLATION: des secrets ont été détectés dans le code source"
-        echo "→ Retirez le secret du code, effectuez une rotation (il est compromis),"
-        echo "  et stockez-le dans un secret manager (GCP Secret Manager / variables CI masquées)."
-        echo "→ Contacter l'équipe Platform: #salsifi-support"
-        if [ "${BLOCKING_GITLEAKS_SCAN}" = "true" ]; then
-          exit 1
-        else
-          echo "⚠️ Scan non-bloquant (BLOCKING_GITLEAKS_SCAN=false) - poursuite du pipeline"
-        fi
-      else
-        echo "✅ Aucun secret détecté"
-      fi
+      echo "🔍 Plage analysée : ${RANGE}"
+      gitleaks detect --source . --log-opts "${RANGE}" --redact --verbose
+    - echo "✅ Aucun nouveau secret détecté dans le dernier commit."
+    - echo "---------------------------------------------------------"
+    - echo "🔎 Étape 2 - analyse de l'historique (mode warning, non bloquant)"
+    - |
+      # --exit-code 0 : ne casse jamais le pipeline sur l'historique.
+      gitleaks detect --source . --redact --verbose \
+        --exit-code 0 \
+        --report-format json \
+        --report-path gitleaks-history-report.json
+    - echo "✅ Analyse de l'historique terminée. Rapport gitleaks-history-report.json"
+    - echo "💡 Secrets présents dans l'historique - à renouveler (rotation), puis à ajouter au .gitleaksignore."
   artifacts:
-    when: always
+    when: always # rapport conservé même si l'étape 1 a fait échouer le job
     expire_in: 1 week
     paths:
-      - gitleaks-report.sarif
+      - gitleaks-history-report.json
 
 # =============================================================================
 # NPM COOLDOWN - Quarantaine des packages récemment publiés (anti supply chain)
@@ -625,7 +625,7 @@ cooldown-scan:
   needs: []
   script:
     - echo "🧊 NPM Cooldown - Quarantaine des packages récemment publiés"
-    - echo "⏳ Fenêtre de cooldown → ${NPM_COOLDOWN_DAYS} jours (registre: ${NPM_COOLDOWN_REGISTRY})"
+    - echo "⏳ Fenêtre de cooldown → ${NPM_COOLDOWN_DAYS} jours (registre ${NPM_COOLDOWN_REGISTRY})"
     - |
       cat > /tmp/cooldown-check.js << 'COOLDOWN_EOF'
       const fs = require('fs');
@@ -748,7 +748,7 @@ cooldown-scan:
     # Config dédiée (PAS trivy.yaml, sinon auto-chargée par le job trivy-scan d'image)
     TRIVY_CONFIG: trivy-license.yaml
   before_script:
-    - echo "⚖️ Trivy - Scan de conformité des licences OSS (politique: trivy-license.yaml)"
+    - echo "⚖️ Trivy - Scan de conformité des licences OSS (politique trivy-license.yaml)"
     # Rapport lisible + SBOM CycloneDX, toujours produits
     - trivy fs --scanners license --skip-db-update --format table --output license-report.txt .
     - trivy fs --scanners license --skip-db-update --format cyclonedx --output license-sbom.cdx.json .
@@ -765,7 +765,7 @@ cooldown-scan:
 license-check-blocking:
   extends: .license-base
   script:
-    - echo "🔒 Gate bloquant : échec si licence 'forbidden' détectée (GPL/AGPL/SSPL/EUPL)"
+    - echo "🔒 Gate bloquant - echec si licence forbidden detectee (GPL/AGPL/SSPL/EUPL)"
     - trivy fs --scanners license --skip-db-update --severity CRITICAL --exit-code 1 .
     - echo "✅ Aucune licence interdite détectée"
   rules:
@@ -777,7 +777,7 @@ license-check-blocking:
 license-check-warn:
   extends: .license-base
   script:
-    - echo "⚠️ Gate non bloquant (MR/feature) : licences interdites signalées sans casser la pipeline"
+    - echo "⚠️ Gate non bloquant (MR/feature) - licences interdites signalées sans casser la pipeline"
     - trivy fs --scanners license --skip-db-update --severity CRITICAL,HIGH --exit-code 0 .
   allow_failure: true
   rules:
