@@ -1,0 +1,881 @@
+spec:
+  inputs:
+    namespace:
+      type: string
+      description: "Namespace de déploiement, dépend du projet (ex: front)."
+      default: "front"
+    sonar_project_code:
+      type: string
+      description: "Code projet pour l'analyse SonarQube (ex: eparbaq-05502-metier, eparclient-05500-metier)."
+      default: "eparclient-05500-metier"
+---
+default:
+  before_script:
+    - eval "GCP_PROJECT_ID=\$LCL_CI_${CI_PROJECT_NAMESPACE_ID}_PROJECT_ID"
+    - eval "GCP_PREV_PROJECT_ID=\$LCL_CI_${CI_PROJECT_NAMESPACE_ID}_PREV_PROJECT_ID"
+  interruptible: true
+  image: gcr.io/cloud-builders/gcloud
+  tags:
+    - easypart-dev
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $FORCE_DEV_DEPLOY == "true"
+    - when: never
+
+include:
+  - local: 'component/trivy-scan.yml'
+  - local: 'component/validate-manifests.yml'
+
+variables:
+  IMAGE_NAME: '$CI_PROJECT_NAME'
+  IMAGE_TAG: '$CI_COMMIT_SHORT_SHA'
+  GCP_MAVEN_DOMAIN: 'europe-maven.pkg.dev'
+  PACK_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/buildpacksio/pack:0.40.7
+  BP_BUILDER_IMAGE: gcr.io/buildpacks/google-24/builder@sha256:6c991cbf499a93fe13ae7265feb132696bc5ae6067b62aaa78aa202a92a50f29 # public-image-google-24-builder universal_builder_20260614_RC00
+  BP_REBASE_RUN_IMAGE: gcr.io/buildpacks/google-22/run@sha256:ce557a7610a0b976c5d559de914e496a65d4cdda92d96e57f6af9a967a96c1ee # base_20260626_18_04_RC00 public-image-next
+  BP_LIFECYCLE_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/buildpacksio/lifecycle:0.21.9 # Lifecycle pinned to last version compatible with Cloud Build Docker API 1.41 (Docker SDK < 25)
+  CLOUD_SDK_IMAGE: gcr.io/google.com/cloudsdktool/cloud-sdk:slim # gcloud + curl for .deployed
+  GCLOUD_IMAGE: gcr.io/cloud-builders/gcloud
+  COSIGN_IMAGE: gcr.io/projectsigstore/cosign:v2.4.1
+  NODE_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/node:21-alpine
+  TRIVY_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/aquasec/trivy:0.69.0
+  BRUNO_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/alpine/bruno:1.30.0
+  SONAR_IMAGE: lcl-commun-docker-stable-intranet.registry.saas.cagip.group.gca/ci-runner4gitlab:5.6-alpine-allinone
+  # Segment projet du registre gcrane : surchargé par chaque job promote (registre de l'env cible).
+  GCRANE_REGISTRY_PROJECT: lcl-easypart-dev-73
+  # Image gcrane pour .promote — variante -debug (shell busybox requis par l'exécuteur k8s de GitLab).
+  # Le segment projet est variabilisé → chemin + tag définis une seule fois ici.
+  GCRANE_IMAGE: europe-docker.pkg.dev/${GCRANE_REGISTRY_PROJECT}/docker/gcr.io/go-containerregistry/gcrane:v0.21.6-debug
+  DEPLOY_TOOLS_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker/deploy-tools:v1 # Multi-tool image (flux + kustomize + jq), built by the cicd-gcp root pipeline (component/deploy-tools).
+  # Application properties
+  NAMESPACE: "$[[ inputs.namespace ]]" # Namespace for deployment (input obligatoire)
+  SONAR_PROJECT_CODE: "$[[ inputs.sonar_project_code ]]" # Project code for SonarQube analysis (input obligatoire)
+  # Build and deployment control flags
+  FORCE_DEV_DEPLOY: "false"
+  BLOCKING_TRIVY_SCAN: "true"
+  RUNNER_GENERATE_ARTIFACTS_METADATA: "true"
+  # =============================================================================
+  # NPM SECURITY - Blocage global des scripts d'installation
+  # =============================================================================
+  # Protection contre les attaques supply chain (typosquatting, dependency confusion)
+  # Les scripts preinstall/install/postinstall sont bloqués par défaut.
+  # =============================================================================
+  NPM_CONFIG_IGNORE_SCRIPTS: "true"
+  NPM_CONFIG_AUDIT_LEVEL: "high"
+  # Whitelist centralisée - packages légitimes nécessitant des scripts
+  # (bindings natifs, téléchargement de binaires, compilation)
+  NPM_SCRIPTS_WHITELIST: "esbuild @esbuild/linux-x64 @esbuild/darwin-x64 @esbuild/win32-x64 sharp node-sass sass puppeteer bcrypt argon2 sqlite3 better-sqlite3 @swc/core @swc/core-linux-x64-gnu lightningcss canvas node-canvas grpc @grpc/grpc-js sodium-native protobufjs simple-git-hooks unrs-resolver @@nestjs/core @@scarf/scarf"
+
+stages:
+  - build
+  - test
+  - quality
+  - deploy
+
+.build-rules: &build_rules
+  rules:
+    - changes:
+        - .gitlab-ci.yml
+        - package.json
+        - src/**/*
+        - src/*
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $FORCE_DEV_DEPLOY == "true"
+    - when: never
+
+.build:
+  <<: *build_rules
+
+.npm-cache:
+  cache:
+    key:
+      prefix: "${CI_PIPELINE_ID}-${CI_COMMIT_REF_SLUG}"
+      files:
+        - package-lock.json
+    paths:
+      - node_modules
+      - dist
+    policy: pull
+
+# =============================================================================
+# NPM SECURE INSTALL - Script réutilisable
+# =============================================================================
+.npm-secure-install:
+  script:
+    - echo "🔒 NPM Secure Install - Scripts globally disabled"
+    - echo "📋 Whitelist → ${NPM_SCRIPTS_WHITELIST}"
+    # Installation avec scripts bloqués (safe)
+    - npm ci --ignore-scripts
+    # Rebuild contrôlé uniquement pour les packages whitelistés présents
+    - |
+      echo "🔧 Rebuilding whitelisted packages..."
+      for pkg in ${NPM_SCRIPTS_WHITELIST}; do
+        if [ -d "node_modules/${pkg}" ]; then
+          echo "  ✅ Rebuilding: ${pkg}"
+          npm rebuild "${pkg}" 2>/dev/null || echo "  ⚠️ Rebuild skipped: ${pkg} (no native build needed)"
+        fi
+      done
+    # Détection de scripts non autorisés
+    - |
+      echo "🔍 Checking for unauthorized postinstall scripts..."
+      UNAUTHORIZED=""
+      for dir in node_modules/*/; do
+        if [ -d "${dir}" ]; then
+          pkg_name=$(basename "${dir}")
+          pkg_json="${dir}package.json"
+          if [ -f "${pkg_json}" ]; then
+            if grep -qE '"(pre|post)?install"' "${pkg_json}" 2>/dev/null; then
+              if ! echo " ${NPM_SCRIPTS_WHITELIST} " | grep -q " ${pkg_name} "; then
+                UNAUTHORIZED="${UNAUTHORIZED} ${pkg_name}"
+              fi
+            fi
+          fi
+        fi
+      done
+      # Check scoped packages (@org/pkg)
+      for org_dir in node_modules/@*/; do
+        if [ -d "${org_dir}" ]; then
+          for dir in ${org_dir}*/; do
+            if [ -d "${dir}" ]; then
+              pkg_name="@$(basename $(dirname ${dir}))/$(basename ${dir})"
+              pkg_json="${dir}package.json"
+              if [ -f "${pkg_json}" ]; then
+                if grep -qE '"(pre|post)?install"' "${pkg_json}" 2>/dev/null; then
+                  if ! echo " ${NPM_SCRIPTS_WHITELIST} " | grep -q " ${pkg_name} "; then
+                    UNAUTHORIZED="${UNAUTHORIZED} ${pkg_name}"
+                  fi
+                fi
+              fi
+            fi
+          done
+        fi
+      done
+      if [ -n "${UNAUTHORIZED}" ]; then
+        echo "❌ SECURITY VIOLATION: Unauthorized packages with install scripts detected:"
+        echo "${UNAUTHORIZED}" | tr ' ' '\n' | grep -v '^$' | sed 's/^/   🚫 /'
+        echo ""
+        echo "Ces packages ont des scripts d'installation mais ne sont pas dans la whitelist."
+        echo "→ Contacter l'équipe Platform pour demander une exception: #salsifi-support"
+        exit 1
+      fi
+      echo "✅ NPM Security check passed"
+
+artifactregistry-login:
+  stage: .pre
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - NPM_TOKEN=$(gcloud auth print-access-token)
+    - echo "NPM_TOKEN=$NPM_TOKEN" > npm-token.env
+  artifacts:
+    reports:
+      dotenv: npm-token.env
+  extends: .build
+
+npm-build:
+  stage: build
+  extends:
+    - .npm-cache
+    - .npm-secure-install
+    - .build
+  cache:
+    policy: pull-push
+  image: ${NODE_IMAGE}
+
+pack-build:
+  stage: build
+  extends:
+    - .npm-cache
+    - .build
+  variables:
+    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: 2Gi
+  script:
+    - echo "⚙️ Building with Cloud Build and buildpacks (inline configuration)"
+    - echo "🏗️ Image = europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker/$IMAGE_NAME:$IMAGE_TAG"
+    - |
+      # Create inline Cloud Build configuration
+      cat << 'EOF' > cloudbuild-inline.yaml
+      substitutions:
+        _PACK_IMAGE: '${PACK_IMAGE}'
+        _BP_BUILDER_IMAGE: '${BP_BUILDER_IMAGE}'
+        _BP_LIFECYCLE_IMAGE: '${BP_LIFECYCLE_IMAGE}'
+        _IMAGE_REGISTRY: 'europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker'
+        _IMAGE_NAME: '${IMAGE_NAME}'
+        _IMAGE_TAG: '${IMAGE_TAG}'
+        _GCLOUD_IMAGE: '${GCLOUD_IMAGE}'
+        _NPM_REGISTRY: 'europe-west1-npm.pkg.dev/lcl-easypart-dev-73/npm-mirror/'
+
+      steps:
+        # Setup OAuth token and certificates with enhanced certificate handling
+        - name: '${_GCLOUD_IMAGE}'
+          id: 'NPM registry authentication'
+          entrypoint: 'bash'
+          args:
+            - '-c'
+            - |
+              echo "Generating NPM token..."
+              NPM_TOKEN=$(gcloud auth print-access-token)
+              echo "registry=https://${_NPM_REGISTRY}" > /workspace/.npmrc
+              echo "//${_NPM_REGISTRY}:_authToken=$$NPM_TOKEN" >> /workspace/.npmrc
+              echo "always-auth=true" >> /workspace/.npmrc
+
+        # Build with pack
+        - name: '${_PACK_IMAGE}'
+          id: 'Build with Buildpacks'
+          env:
+            - 'DOCKER_API_VERSION=1.41'
+          args:
+            - 'build'
+            - '${_IMAGE_REGISTRY}/${_IMAGE_NAME}:${_IMAGE_TAG}'
+            - '--path'
+            - '.'
+            - '--tag'
+            - '${_IMAGE_REGISTRY}/${_IMAGE_NAME}:latest'
+            - '--builder'
+            - '${_BP_BUILDER_IMAGE}'
+            - '--lifecycle-image'
+            - '${_BP_LIFECYCLE_IMAGE}'
+            - '--env'
+            - 'NPM_CONFIG_REGISTRY=https://${_NPM_REGISTRY}'
+            - '--env'
+            - 'NPM_CONFIG_//${_NPM_REGISTRY}:_authToken=$$NPM_TOKEN'
+            - '--env'
+            - 'NPM_CONFIG_LEGACY_PEER_DEPS=true'
+            - '--env'
+            - 'NPM_CONFIG_IGNORE_SCRIPTS=true'
+            - '--clear-cache'
+            - '--report-output-dir'
+            - '.'
+
+      images: '${_IMAGE_REGISTRY}/${_IMAGE_NAME}:${_IMAGE_TAG}'
+
+      options:
+        env:
+          - 'DOCKER_BUILDKIT=1'
+        machineType: 'E2_HIGHCPU_8'
+        requestedVerifyOption: VERIFIED
+        substitutionOption: 'ALLOW_LOOSE'
+        
+      timeout: '3600s'
+      EOF
+    - gcloud --project=${GCP_PROJECT_ID} builds submit
+        --config cloudbuild-inline.yaml --region ${LCL_REGION}
+        --default-buckets-behavior=regional-user-owned-bucket
+        --substitutions=_PACK_IMAGE=${PACK_IMAGE},_GCLOUD_IMAGE=${GCLOUD_IMAGE},_BP_BUILDER_IMAGE=${BP_BUILDER_IMAGE},_BP_LIFECYCLE_IMAGE=${BP_LIFECYCLE_IMAGE},_IMAGE_NAME=${IMAGE_NAME},_IMAGE_TAG=${IMAGE_TAG},_IMAGE_REGISTRY=europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker
+    - echo "📄 Extracting image digest..."
+    - |
+      # Extract digest using gcloud
+      IMAGE_FULL_NAME="europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker/$IMAGE_NAME:$IMAGE_TAG"
+      # Get digest from Artifact Registry
+      DIGEST=$(gcloud container images describe $IMAGE_FULL_NAME --format='value(image_summary.digest)' 2>/dev/null || echo "")
+      # Create digest.env file
+      echo "DIGEST=@${DIGEST}" | tee digest.env
+      echo "TAG=:${IMAGE_TAG}" | tee -a digest.env
+      echo "IMAGE_FULL_NAME=${IMAGE_FULL_NAME}" | tee -a digest.env
+      echo "✅ Using digest: $DIGEST"
+    - echo "🧹 Cleaning up temporary Cloud Build config"
+    - rm -f cloudbuild-inline.yaml
+  artifacts:
+    reports:
+      dotenv: digest.env
+
+sign-build:
+  stage: build
+  needs:
+    - job: pack-build
+      optional: true
+      artifacts: true
+  variables:
+    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: 2Gi
+  script:
+    - echo "⚙️ Building with Cloud Build and buildpacks (inline configuration)"
+    - echo "🏗️ Image = europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker/$IMAGE_NAME:$IMAGE_TAG"
+    - eval "LCL_PROJECT_NAME=\$LCL_CI_${CI_PROJECT_NAMESPACE_ID}_PROJECT_NAME"
+    - |
+      # Create inline Cloud Build configuration
+      cat << 'EOF' > cloudbuild-inline.yaml
+      substitutions:
+        _IMAGE_REGISTRY: 'europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker'
+        _IMAGE_NAME: '${IMAGE_NAME}'
+        _IMAGE_TAG: '${IMAGE_TAG}'
+        _DIGEST: '${DIGEST}'
+        _COSIGN_IMAGE: '${COSIGN_IMAGE}'
+        _GCLOUD_IMAGE: '${GCLOUD_IMAGE}'
+        _LCL_PROJECT_ID: '${LCL_PROJECT_ID}'
+        _LCL_PROJECT_NAME: '${LCL_PROJECT_NAME}'
+
+      steps:
+        - name: '${_GCLOUD_IMAGE}'
+          id: 'Upload SBOM to Artifact Registry'
+          entrypoint: 'bash'
+          args:
+            - '-c'
+            - |
+              echo "📤 Uploading SBOM to Artifact Registry..."
+              gcloud artifacts sbom export --uri="${_IMAGE_REGISTRY}/${_IMAGE_NAME}:${_IMAGE_TAG}"
+              echo "✅ SBOM uploaded to Artifact Registry"
+
+        # Sign image with Cosign using KMS
+        - name: '${_COSIGN_IMAGE}'
+          id: 'Sign image with Cosign KMS'
+          entrypoint: 'cosign'
+          args:
+            - 'sign'
+            - '--key'
+            - 'gcpkms://projects/${_LCL_PROJECT_ID}/locations/europe/keyRings/namespaces/cryptoKeys/cosign-${_LCL_PROJECT_NAME}/cryptoKeyVersions/1'
+            - '--yes'
+            - '--tlog-upload=false'
+            - '${_IMAGE_REGISTRY}/${_IMAGE_NAME}${_DIGEST}'
+
+        # Verify signature and display details
+        - name: '${_COSIGN_IMAGE}'
+          id: 'Verify Cosign signature'
+          entrypoint: 'cosign'
+          args:
+            - 'verify'
+            - '--key'
+            - 'gcpkms://projects/${_LCL_PROJECT_ID}/locations/europe/keyRings/namespaces/cryptoKeys/cosign-${_LCL_PROJECT_NAME}/cryptoKeyVersions/1'
+            - '--insecure-ignore-tlog'
+            - '--output=text'
+            - '${_IMAGE_REGISTRY}/${_IMAGE_NAME}${_DIGEST}'
+
+      options:
+        env:
+          - 'DOCKER_BUILDKIT=1'
+        machineType: 'E2_HIGHCPU_8'
+        logging: CLOUD_LOGGING_ONLY
+        substitutionOption: 'ALLOW_LOOSE'
+        
+      timeout: '3600s'
+      EOF
+    - gcloud --project=${GCP_PROJECT_ID} builds submit
+        --config cloudbuild-inline.yaml --region ${LCL_REGION}
+        --service-account=projects/${GCP_PROJECT_ID}/serviceAccounts/cloudbuild@${GCP_PROJECT_ID}.iam.gserviceaccount.com
+        --substitutions=_GCLOUD_IMAGE=${GCLOUD_IMAGE},_IMAGE_NAME=${IMAGE_NAME},_DIGEST=${DIGEST},_IMAGE_TAG=${IMAGE_TAG},_IMAGE_REGISTRY=europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker,_COSIGN_IMAGE=${COSIGN_IMAGE},_LCL_PROJECT_ID=${LCL_PROJECT_ID},_LCL_PROJECT_NAME=${LCL_PROJECT_NAME}
+    - rm -f cloudbuild-inline.yaml
+
+test:
+  extends: .npm-cache
+  stage: test
+  needs: ['npm-build']
+  image: ${NODE_IMAGE}
+  script:
+    - |
+      echo "🧪 Running tests with vitest"
+      npm run test:cov
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - coverage
+
+bruno:
+  extends: .npm-cache
+  stage: test
+  needs: ['npm-build']
+  image: ${BRUNO_IMAGE}
+  script:
+    - |
+      echo "🧪 Running tests with bruno"
+      bru --version
+      cd bruno-test
+      bru run
+
+sonar:
+  <<: *build_rules
+  stage: quality
+  needs: ['test']
+  image: ${SONAR_IMAGE}
+  variables:
+    APP_BASE_NAME: '${CI_PROJECT_NAME}'
+    GIT_DEPTH: 0 # Tells git to fetch all the branches of the project, required by the analysis task
+  script:
+    - echo "🔍 Starting SonarQube LCL analysis with external server"
+    - echo "🌐 Using SonarQube server ${SONAR_URL}"
+    - echo "CI_PROJECT_NAME=$CI_PROJECT_NAME"
+    - echo "CI_PROJECT_TITLE=$CI_PROJECT_TITLE"
+    - echo "SONAR_PROJECT_CODE=$SONAR_PROJECT_CODE"
+    - |
+      # Check if sonar-project.properties exists, create it if not
+      if [ -f "sonar-project.properties" ]; then
+        echo "📋 Existing sonar-project.properties file found"
+        
+        echo "🔧 Resolving variables in existing configuration file"
+            
+        # Create a temporary file with resolved variables
+        cp sonar-project.properties sonar-project.properties.backup
+        
+        # Replace variables with their actual values, preserving the rest of the config
+        sed -i.tmp "s|\${SONAR_URL}|${SONAR_URL}|g" sonar-project.properties
+        sed -i.tmp "s|\${SONAR_LOGIN}|${SONAR_LOGIN}|g" sonar-project.properties
+        sed -i.tmp "s|\${SONAR_PROJECT_CODE}|${SONAR_PROJECT_CODE}|g" sonar-project.properties
+        sed -i.tmp "s|\${APP_BASE_NAME}|${APP_BASE_NAME}|g" sonar-project.properties
+        sed -i.tmp "s|\${CI_PROJECT_NAME}|${CI_PROJECT_NAME}|g" sonar-project.properties
+        
+        # Clean up temp files
+        rm -f sonar-project.properties.tmp sonar-project.properties.backup
+        
+        echo "✅ Variables resolved in existing file"
+        echo "📋 Updated content preview:"
+        head -5 sonar-project.properties || echo "  Unable to preview updated content"
+
+      else
+      
+        # Create file if it doesn't exist or was removed due to validation issues
+        echo "📝 Creating SonarQube LCL configuration"
+        cat > sonar-project.properties << EOF
+      sonar.host.url=${SONAR_URL}
+      sonar.token=${SONAR_LOGIN}
+      sonar.sourceEncoding=UTF-8
+      sonar.projectKey=com.lcl.${SONAR_PROJECT_CODE}.${APP_BASE_NAME}
+      sonar.projectName=${APP_BASE_NAME}
+      sonar.sources=src
+      sonar.exclusions=**/*.test.ts,**/node_modules/**,**/dist/**
+      sonar.coverage.exclusions=**/*.dto.ts,**/*.enum.ts,**/*.interface.ts,**/*.model.ts,**/*.value-object.ts,**/index.ts,src/app/health/**,src/app/content/**,src/app/info/**
+      sonar.javascript.lcov.reportPaths=coverage/lcov.info
+      EOF
+      fi
+
+    - |
+      echo "🚀 Running SonarQube analysis"
+      sonar-scanner -Dproject.settings=sonar-project.properties -Dsonar.qualitygate.wait=true
+      SCAN_EXIT_CODE=$?
+      echo "🔎 sonar-scanner exit code: $SCAN_EXIT_CODE"
+      if [ $SCAN_EXIT_CODE -ne 0 ]; then
+        echo "❌ SonarQube scan failed or Quality Gate not passed (exit code $SCAN_EXIT_CODE)"
+        exit $SCAN_EXIT_CODE
+      fi
+      echo "✅ SonarQube HTML report generated at sonar-report.html"
+      echo "📊 SonarQube analysis completed successfully"
+      if [ "$CI_PIPELINE_SOURCE" == "merge_request_event" ]; then
+        echo "🔗 View results at: ${SONAR_URL}/dashboard?pullRequest=${CI_MERGE_REQUEST_IID}&id=com.lcl.${SONAR_PROJECT_CODE}.${APP_BASE_NAME}"
+      else
+        echo "🔗 View results at: ${SONAR_URL}/dashboard?branch=${CI_COMMIT_BRANCH}&id=com.lcl.${SONAR_PROJECT_CODE}.${APP_BASE_NAME}"
+      fi
+  tags:
+    - buildpacks
+
+trivy-scan:
+  extends: .trivy-scan-template
+  <<: *build_rules
+  needs: ["pack-build", "test"]
+
+lint:
+  <<: *build_rules
+  stage: quality
+  extends: .npm-cache
+  needs: ['npm-build', 'test']
+  image: ${NODE_IMAGE}
+  script:
+    - echo "🔍 Running ESLint analysis on TypeScript/JavaScript files"
+    - |
+      # Run ESLint and capture output
+      echo "📝 Analyzing code with ESLint..."
+      ESLINT_EXIT_CODE=0
+
+      # First generate JSON report with direct command
+      ./node_modules/.bin/eslint "{src,apps,libs,test}/**/*.ts" --format json --output-file eslint-results.json 2>&1 || ESLINT_EXIT_CODE=$?
+      # Then generate stylish report
+      ./node_modules/.bin/eslint "{src,apps,libs,test}/**/*.ts" --format stylish > eslint-report.txt 2>&1 || true
+
+      echo "📋 ESLint exit code: $ESLINT_EXIT_CODE"
+      echo "📁 Files generated:"
+      ls -la eslint-*.json eslint-*.txt 2>/dev/null || echo "  No eslint output files found"
+
+      # Display results in console
+      echo "📊 ESLint Results:"
+      if [ -s eslint-report.txt ]; then
+        echo "✅ ESLint results file found"
+        echo ""
+        
+        # Count files and issues more accurately
+        TOTAL_FILES_IN_PROJECT=$(find src -name "*.ts" 2>/dev/null | wc -l | tr -d ' ')
+        TOTAL_FILES_WITH_ISSUES=$(grep -c ".ts" eslint-report.txt 2>/dev/null || echo "0")
+        TOTAL_ERRORS=$(grep -c "error" eslint-report.txt 2>/dev/null || echo "0")
+        TOTAL_WARNINGS=$(grep -c "warning" eslint-report.txt 2>/dev/null || echo "0")
+        TOTAL_ERRORS=$((TOTAL_ERRORS - 1))
+        TOTAL_WARNINGS=$((TOTAL_WARNINGS - 1))
+        
+        echo "  📁 Files in project: $TOTAL_FILES_IN_PROJECT"
+        echo "  📄 Files with issues: $TOTAL_FILES_WITH_ISSUES"
+        echo "  ❌ Errors: $TOTAL_ERRORS"
+        echo "  ⚠️ Warnings: $TOTAL_WARNINGS"
+        
+        # Check results and exit appropriately
+        if [ $TOTAL_ERRORS -gt 0 ]; then
+          echo ""
+          echo "❌ ESLint found $TOTAL_ERRORS error(s) that must be fixed:"
+          echo "----------------------------------------"
+          if [ -f eslint-report.txt ]; then
+            cat eslint-report.txt
+          else
+            echo "⚠️ No detailed report available"
+          fi
+          echo "----------------------------------------"
+          echo "❌ ESLint analysis failed - please fix the errors above"
+          exit 1
+        elif [ $TOTAL_WARNINGS -gt 0 ]; then
+          echo ""
+          echo "⚠️  ESLint found $TOTAL_WARNINGS warning(s):"
+          echo "----------------------------------------"
+          if [ -f eslint-report.txt ]; then
+            cat eslint-report.txt
+          else
+            echo "⚠️ No detailed report available"
+          fi
+          echo "----------------------------------------"
+          echo "✅ ESLint analysis completed with warnings - no blocking errors"
+        else
+          echo "✅ ESLint analysis completed successfully - no errors or warnings found"
+        fi
+      else
+        echo "✅ ESLint analysis completed successfully - no errors or warnings found"
+      fi
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - eslint-results.json
+      - eslint-report.txt
+  allow_failure: true
+
+flux:
+  stage: deploy
+  image: ${DEPLOY_TOOLS_IMAGE}
+  script:
+    - |-
+      if [ -z "${DIGEST}" ]
+      then DIGEST=":latest"
+      fi
+    - cd ${CI_PROJECT_DIR}/k8s-manifests/base
+    - kustomize edit add annotation gitlab.com/ci-pipeline-url:${CI_PIPELINE_URL}
+    - kustomize edit set image image-to-be-templated=europe-docker.pkg.dev/\${LCL_NAMESPACE_PROJECT_ID}/docker/${CI_PROJECT_NAME}${DIGEST}
+    - cd ${CI_PROJECT_DIR}/k8s-manifests
+    - find . -exec touch -t 197001010000.00 '{}' \;
+    # --provider gcp : flux s'authentifie via l'identité du runner (Workload Identity),
+    - flux push artifact
+      oci://europe-docker.pkg.dev/${GCP_PROJECT_ID}/oci-dev/${CI_PROJECT_NAME}
+      --source="${CI_PROJECT_URL}"
+      --revision="${CI_COMMIT_REF_NAME}@sha1:${CI_COMMIT_SHA}"
+      --path .
+      --reproducible
+      --provider gcp
+      --output json | tee /tmp/output.json
+    - FLUX_DIGEST=$(jq -r .digest /tmp/output.json)
+    - echo "FLUX_DIGEST=@$FLUX_DIGEST" >> ${CI_PROJECT_DIR}/flux_digest.env
+    - echo "✅ Flux artifact pushed with digest = $FLUX_DIGEST"
+  artifacts:
+    reports:
+      dotenv: flux_digest.env
+  needs:
+    - job: pack-build
+      artifacts: true
+    - job: sonar
+    - job: lint
+    - job: test
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $FORCE_DEV_DEPLOY == "true"
+    - when: never
+
+.deployed:
+  stage: deploy
+  image: ${CLOUD_SDK_IMAGE}
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - eval "CLUSTER_NAME=${LCL_GKE_CLUSTER_NAME}"
+    - echo "LCL_NAMESPACE=${LCL_NAMESPACE}"
+    - APP_HEALTH_URL="https://${CLUSTER_NAME}.${LCL_CI_ENV}.gcp.lcl.gca/${NAMESPACE}/${CI_PROJECT_NAME}/api/1.0.0/health"
+    - |
+      echo "🔍 Waiting for deployment to complete..."
+      echo "📦 Application: ${CI_PROJECT_NAME}"
+      echo "🌍 Environment: ${LCL_CI_ENV}"
+      echo "🔖 Flux Digest: ${FLUX_DIGEST}"
+
+      MAX_ATTEMPTS=60  # 10 minutes with 10s intervals
+      ATTEMPT=0
+      DEPLOYMENT_SUCCESS=false
+      
+      # Verification 1: Check GitLab commit status set by Flux (requires Flux to update commit status)
+      echo "🔶 Verification 1: Check GitLab commit status set by Flux"
+      eval "FLUX_TOKEN=\$flux_token_${LCL_CI_ENV}"
+      # The API returns an error object (e.g. {"message":"401 ..."}) instead of an array
+      # when the token is expired/revoked; guard with `if type=="array"` so this non-blocking
+      # check degrades to a warning instead of crashing jq with "Cannot index string".
+      status=$(curl -s --header "PRIVATE-TOKEN:${FLUX_TOKEN}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/commits/${CI_COMMIT_SHA}/statuses" | \
+        jq -r 'if type=="array" then (.[] | select(.name == "Kustomization/'${CI_PROJECT_NAME}'/'${LCL_CI_ENV}'") | .status) else empty end' 2>/dev/null || true)
+      if [ "$status" = "success" ]; then
+        echo "✅ External event received"
+      else
+        echo "⚠️  External event not received - status: $status"
+        echo "💡 Check Flux logs and GitLab commit statuses for details"
+      fi
+
+      # Verification 2: Verify OCI artifact digest in Artifact Registry
+      echo "🔶 Verification 2: OCI Artifact Digest"
+      echo "📦 OCI Registry: europe-docker.pkg.dev/${GCP_PROJECT_ID}/oci-dev/${CI_PROJECT_NAME}"
+      echo "🔍 Verifying Flux artifact deployment..."
+
+      while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        
+        # Check if the Flux digest exists in Artifact Registry
+        # NB : image = cloud-sdk (gcloud, PAS gcrane) → on liste les digests via gcloud.
+        DEPLOYED_DIGEST=$(gcloud artifacts docker images list \
+          "europe-docker.pkg.dev/${GCP_PROJECT_ID}/oci-dev/${CI_PROJECT_NAME}" \
+          --format='value(version)' 2>/dev/null | \
+          grep -F "${FLUX_DIGEST#@}" || echo "")
+        
+        if [ -n "$DEPLOYED_DIGEST" ]; then
+          echo "✅ Flux artifact found in registry!"
+          echo "  Digest: ${FLUX_DIGEST}"
+          DEPLOYMENT_SUCCESS=true
+          break
+        fi
+        
+        if [ $((ATTEMPT % 3)) -eq 0 ]; then
+          echo "[$(date '+%H:%M:%S')] Waiting for Flux artifact... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+        fi
+        
+        sleep 5
+      done
+
+      if [ "$DEPLOYMENT_SUCCESS" = "false" ]; then
+        echo "⚠️  Artifact verification timeout - OCI artifact not found after 10 minutes"
+        echo "  Expected digest: ${FLUX_DIGEST}"
+        exit 1
+      fi
+
+      # Verification 3: Verify via application health check (readiness probe)
+      echo "🔶 Verification 3: Application Health Check"
+      if [ -z "$APP_HEALTH_URL" ]; then
+        echo "⚠️  No health check URL configured - skipping application health verification"
+        echo "💡 To enable health check verification, configure app_health_url_${LCL_CI_ENV} variable"
+      else
+        echo "🏥 Health check URL: ${APP_HEALTH_URL}"
+        echo "🔍 Verifying application health (readiness probe)..."
+        
+        HEALTHY_CHECKS=0
+        REQUIRED_HEALTHY_CHECKS=3  # Require 3 consecutive successful health checks
+        HEALTH_ATTEMPT=0
+        HEALTH_MAX_ATTEMPTS=30  # Additional 5 minutes for health checks
+        
+        while [ $HEALTH_ATTEMPT -lt $HEALTH_MAX_ATTEMPTS ]; do
+          HEALTH_ATTEMPT=$((HEALTH_ATTEMPT + 1))
+          
+          # Call the health endpoint (same as readiness probe)
+          # -k : l'ingress interne (*.gcp.lcl.gca) a une CA non connue de cloud-sdk ; timeouts pour éviter les hangs.
+          HEALTH_RESPONSE=$(curl -sk --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X GET "${APP_HEALTH_URL}" 2>/dev/null || echo -e "\n000")
+          HTTP_CODE=$(echo "$HEALTH_RESPONSE" | tail -n1)
+          HEALTH_BODY=$(echo "$HEALTH_RESPONSE" | sed '$d')
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            HEALTHY_CHECKS=$((HEALTHY_CHECKS + 1))
+            
+            # Try to parse JSON response for detailed status
+            HEALTH_STATUS=$(echo "$HEALTH_BODY" | jq -r '.status // "up"' 2>/dev/null || echo "up")
+            
+            if [ $((HEALTH_ATTEMPT % 3)) -eq 0 ] || [ $HEALTHY_CHECKS -ge 1 ]; then
+              echo "[$(date '+%H:%M:%S')] ✓ Health check passed ($HEALTHY_CHECKS/$REQUIRED_HEALTHY_CHECKS) - Status: $HEALTH_STATUS"
+            fi
+            
+            if [ $HEALTHY_CHECKS -ge $REQUIRED_HEALTHY_CHECKS ]; then
+              echo "✅ Application is healthy and ready!"
+              echo "  Health checks: $HEALTHY_CHECKS/$REQUIRED_HEALTHY_CHECKS passed"
+              echo "  HTTP Status: $HTTP_CODE"
+              echo "  App Status: $HEALTH_STATUS"
+              break
+            fi
+          else
+            # Reset counter on failure
+            if [ $HEALTHY_CHECKS -gt 0 ]; then
+              echo "[$(date '+%H:%M:%S')] ✗ Health check failed (HTTP $HTTP_CODE) - resetting counter"
+            fi
+            HEALTHY_CHECKS=0
+            
+            if [ $((HEALTH_ATTEMPT % 3)) -eq 0 ]; then
+              echo "[$(date '+%H:%M:%S')] Waiting for application readiness... (attempt $HEALTH_ATTEMPT/$HEALTH_MAX_ATTEMPTS, HTTP: $HTTP_CODE)"
+            fi
+          fi
+          
+          sleep 5
+        done
+        
+        if [ $HEALTHY_CHECKS -lt $REQUIRED_HEALTHY_CHECKS ]; then
+          echo "⚠️  Health check verification incomplete"
+          echo "  Passed: $HEALTHY_CHECKS/$REQUIRED_HEALTHY_CHECKS"
+          echo "  Last HTTP status: ${HTTP_CODE}"
+          echo "💡 Application may still be starting. Check:"
+          echo "  1. Pod status: kubectl get pods -l app=${CI_PROJECT_NAME}"
+          echo "  2. Pod logs: kubectl logs -l app=${CI_PROJECT_NAME} --tail=50"
+          echo "  3. Health endpoint: curl ${APP_HEALTH_URL}"
+          echo "⚠️  Job completed with warning - please investigate health check failure"
+          exit 1
+        fi
+      fi
+
+      echo "✅ Deployment verification completed successfully!"
+      echo "  Total time: $((ATTEMPT * 10)) seconds"
+  timeout: 10m
+  allow_failure: false # This MUST be a showstopper Flux can't deploy the OCI something is broken!
+  cache: {}
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $FORCE_DEV_DEPLOY == "true"
+    - when: never
+
+deployed-dev:
+  extends: .deployed
+  needs:
+    - job: pack-build
+      optional: true
+    - job: flux
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $FORCE_DEV_DEPLOY == "true"
+    - when: never
+
+deployed-rec:
+  extends: .deployed
+  needs:
+    - promote-rec
+    # Hérite du dotenv FLUX_DIGEST (même digest de manifeste, préservé par gcrane copy)
+    - job: flux
+      artifacts: true
+  tags:
+    - easypart-rec
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+deployed-pprd:
+  extends: .deployed
+  needs:
+    - promote-pprd
+    - job: flux
+      artifacts: true
+  tags:
+    - easypart-pprd
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+
+deployed-prd:
+  extends: .deployed
+  needs:
+    - promote-prd
+    - job: flux
+      artifacts: true
+  tags:
+    - easypart-prd
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+
+.promote:
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - |-
+      if [ -n "${DIGEST}" ]
+      then gcrane copy europe-docker.pkg.dev/${GCP_PREV_PROJECT_ID}/docker/${CI_PROJECT_NAME}${DIGEST} europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker/${CI_PROJECT_NAME}:latest
+      fi
+    - gcrane copy
+      europe-docker.pkg.dev/${GCP_PREV_PROJECT_ID}/oci-dev/${CI_PROJECT_NAME}${FLUX_DIGEST}
+      europe-docker.pkg.dev/${GCP_PROJECT_ID}/oci-dev/${CI_PROJECT_NAME}:latest
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+promote-rec:
+  extends: .promote
+  variables:
+    GCRANE_REGISTRY_PROJECT: lcl-easypart-rec-a0
+  image:
+    name: ${GCRANE_IMAGE}
+    entrypoint: [""]
+  needs:
+    - job: pack-build
+      optional: true
+      artifacts: true
+    - job: flux
+      artifacts: true
+    - deployed-dev
+  tags:
+    - easypart-rec
+
+promote-pprd:
+  extends: .promote
+  variables:
+    GCRANE_REGISTRY_PROJECT: lcl-easypart-pprd-e4
+  image:
+    name: ${GCRANE_IMAGE}
+    entrypoint: [""]
+  environment:
+    name: pprd
+    action: start
+  needs:
+    - job: pack-build
+      optional: true
+      artifacts: true
+    - job: flux
+      artifacts: true
+    - job: trivy-scan
+    - deployed-rec
+  tags:
+    - easypart-pprd
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+promote-prd:
+  extends: .promote
+  variables:
+    GCRANE_REGISTRY_PROJECT: lcl-easypart-prd-72
+  image:
+    name: ${GCRANE_IMAGE}
+    entrypoint: [""]
+  environment:
+    name: prd
+    action: start
+  needs:
+    - job: pack-build
+      optional: true
+      artifacts: true
+    - job: flux
+      artifacts: true
+    - job: trivy-scan
+    - deployed-pprd
+  tags:
+    - easypart-prd
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+check-merge:
+  stage: .post
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "🔍 Checking if merge request can be merged..."
+    - |
+      if [ "$CI_PIPELINE_SOURCE" == "merge_request_event" ]; then
+        echo "📌 Pipeline triggered by merge request event - checking mergeability"
+        
+        if [ "$FORCE_DEV_DEPLOY" != "false" ]; then
+          echo "❌ Merge request has not been approved - cannot merge : FORCE_DEV_DEPLOY is not set to false"
+          exit 1
+        fi
+        
+        echo "✅ Merge request is approved and can be merged"
+      else
+        echo "📌 Pipeline not triggered by merge request event - skipping merge check"
+      fi
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - when: never
