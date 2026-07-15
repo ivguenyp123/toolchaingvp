@@ -2,12 +2,10 @@ spec:
   inputs:
     namespace:
       type: string
-      description: "Namespace de déploiement, dépend du projet (ex: front)."
-      default: "front"
+      description: "Namespace de déploiement, dépend du projet (ex: eer, baq). OBLIGATOIRE."
     sonar_project_code:
       type: string
-      description: "Code projet pour l'analyse SonarQube (ex: eparbaq-05502-metier, eparclient-05500-metier)."
-      default: "eparclient-05500-metier"
+      description: "Code projet pour l'analyse SonarQube (ex: eparbaq-05502-metier). OBLIGATOIRE."
 ---
 default:
   before_script:
@@ -27,86 +25,77 @@ workflow:
 
 include:
   - local: 'component/trivy-scan.yml'
-  - local: 'component/validate-manifests.yml'
-
+  
 variables:
-  IMAGE_NAME: '$CI_PROJECT_NAME'
-  IMAGE_TAG: '$CI_COMMIT_SHORT_SHA'
-  GCP_MAVEN_DOMAIN: 'europe-maven.pkg.dev'
+  IMAGE_NAME: "$CI_PROJECT_NAME"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  GCP_MAVEN_DOMAIN: "europe-maven.pkg.dev"
   PACK_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/buildpacksio/pack:0.40.7
-  BP_BUILDER_IMAGE: gcr.io/buildpacks/google-24/builder@sha256:6c991cbf499a93fe13ae7265feb132696bc5ae6067b62aaa78aa202a92a50f29 # public-image-google-24-builder universal_builder_20260614_RC00
-  BP_REBASE_RUN_IMAGE: gcr.io/buildpacks/google-22/run@sha256:ce557a7610a0b976c5d559de914e496a65d4cdda92d96e57f6af9a967a96c1ee # base_20260626_18_04_RC00 public-image-next
-  BP_LIFECYCLE_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/buildpacksio/lifecycle:0.21.9 # Lifecycle pinned to last version compatible with Cloud Build Docker API 1.41 (Docker SDK < 25)
+  BP_BUILDER_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/paketobuildpacks/builder-jammy-tiny:0.0.504
+  BP_RUN_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/paketobuildpacks/run-jammy-tiny:0.2.141
+  BP_REBASE_RUN_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/paketobuildpacks/run-jammy-tiny
+  BP_LIFECYCLE_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/buildpacksio/lifecycle:0.21.9
+  NATIVE_BUILD_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/bellsoft/liberica-native-image-kit-container:jdk-21-nik-23-glibc
+  NATIVE_RUN_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/paketobuildpacks/run-jammy-tiny:0.2.141
   CLOUD_SDK_IMAGE: gcr.io/google.com/cloudsdktool/cloud-sdk:slim # gcloud + curl for .deployed
-  GCLOUD_IMAGE: gcr.io/cloud-builders/gcloud
-  COSIGN_IMAGE: gcr.io/projectsigstore/cosign:v2.4.1
-  NODE_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/node:21-alpine
-  TRIVY_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/aquasec/trivy:0.69.0
-  BRUNO_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/alpine/bruno:1.30.0
-  SONAR_IMAGE: lcl-commun-docker-stable-intranet.registry.saas.cagip.group.gca/ci-runner4gitlab:5.6-alpine-allinone
   # Segment projet du registre gcrane : surchargé par chaque job promote (registre de l'env cible).
   GCRANE_REGISTRY_PROJECT: lcl-easypart-dev-73
   # Image gcrane pour .promote — variante -debug (shell busybox requis par l'exécuteur k8s de GitLab).
   # Le segment projet est variabilisé → chemin + tag définis une seule fois ici.
   GCRANE_IMAGE: europe-docker.pkg.dev/${GCRANE_REGISTRY_PROJECT}/docker/gcr.io/go-containerregistry/gcrane:v0.21.6-debug
   DEPLOY_TOOLS_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker/deploy-tools:v1 # Multi-tool image (flux + kustomize + jq), built by the cicd-gcp root pipeline (component/deploy-tools).
+  COSIGN_IMAGE: gcr.io/projectsigstore/cosign:v2.4.1
+  MAVEN_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/maven:3.9-amazoncorretto-21-debian
+  TRIVY_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/aquasec/trivy:0.69.0
+  SONAR_IMAGE: lcl-commun-docker-stable-intranet.registry.saas.cagip.group.gca/ci-runner4gitlab:5.6-alpine-allinone
   # Application properties
   NAMESPACE: "$[[ inputs.namespace ]]" # Namespace for deployment (input obligatoire)
   SONAR_PROJECT_CODE: "$[[ inputs.sonar_project_code ]]" # Project code for SonarQube analysis (input obligatoire)
+  JAVA_VERSION: "21"
+  APPLICATION_BASE_PATH: ""
+  BP_MAVEN_BUILT_MODULE: "."
+  MAVEN_BUILD_ADDITIONAL_BUILD_ARGUMENTS: ""
+  MAVEN_TEST_ADDITIONAL_BUILD_ARGUMENTS: ""
   # Build and deployment control flags
   FORCE_DEV_DEPLOY: "false"
+  JAVA_NATIVE_BUILD: "true"
+  JAVA_NATIVE_DYNATRACE: "false"
   BLOCKING_TRIVY_SCAN: "true"
   RUNNER_GENERATE_ARTIFACTS_METADATA: "true"
-  # =============================================================================
-  # NPM SECURITY - Blocage global des scripts d'installation
-  # =============================================================================
-  # Protection contre les attaques supply chain (typosquatting, dependency confusion)
-  # Les scripts preinstall/install/postinstall sont bloqués par défaut.
-  # =============================================================================
-  NPM_CONFIG_IGNORE_SCRIPTS: "true"
-  NPM_CONFIG_AUDIT_LEVEL: "high"
-  # Whitelist centralisée - packages légitimes nécessitant des scripts
-  # (bindings natifs, téléchargement de binaires, compilation)
-  NPM_SCRIPTS_WHITELIST: "esbuild @esbuild/linux-x64 @esbuild/darwin-x64 @esbuild/win32-x64 sharp node-sass sass puppeteer bcrypt argon2 sqlite3 better-sqlite3 @swc/core @swc/core-linux-x64-gnu lightningcss canvas node-canvas grpc @grpc/grpc-js sodium-native protobufjs simple-git-hooks unrs-resolver @@nestjs/core @@scarf/scarf"
-  # =============================================================================
-  # GITLEAKS - Détection de secrets (tokens, clés, mots de passe committés)
-  # =============================================================================
   # Image officielle zricethezav/gitleaks épinglée par DIGEST (via mirror GCP).
   # ⚠️ Digest fourni par Gemini dans la story → À VÉRIFIER qu'il correspond bien
   #    à v8.30.1 sur le registre GCP avant mise en prod (sinon le pull échoue).
   GITLEAKS_IMAGE: europe-docker.pkg.dev/lcl-easypart-dev-73/docker-hub-mirror/zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f # v8.30.1
-  # =============================================================================
-  # SUPPLY CHAIN - Cooldown / quarantaine des packages npm récemment publiés
-  # =============================================================================
-  # Refuse toute dépendance dont la version installée a été publiée il y a moins
-  # de NPM_COOLDOWN_DAYS jours : fenêtre pendant laquelle une version compromise
-  # (maintainer piraté, dependency confusion) n'a généralement pas encore été
-  # détectée ni dépubliée. Complète ignore-scripts + whitelist ci-dessus.
-  NPM_COOLDOWN_DAYS: "7"
-  NPM_COOLDOWN_REGISTRY: "https://registry.npmjs.org" # source des dates de publication (pointer vers le mirror si besoin)
-  NPM_COOLDOWN_ALLOWLIST: "" # noms de packages exemptés du cooldown (séparés par des espaces)
-  BLOCKING_COOLDOWN_SCAN: "true"
-  # =============================================================================
-  # LICENCES OPEN SOURCE - Conformité (ACDC-859)
-  # =============================================================================
-  # Politique versionnée dans trivy-license.yaml (catégories natives Trivy).
-  # Le blocage est différencié par branche via les jobs license-check-* :
-  # branche par défaut = blocage dur sur 'forbidden' (GPL/AGPL/SSPL/EUPL ->
-  # CRITICAL) ; MR/feature = avertissement non bloquant. Réutilise TRIVY_IMAGE.
 
 stages:
   - build
   - test
   - quality
-  - deploy
+  - deploy  
+
+# Template pour normaliser APPLICATION_BASE_PATH
+.normalize-base-path: &normalize_base_path
+  - |
+    if [ -n "${APPLICATION_BASE_PATH}" ]; then
+      export NORMALIZED_BASE_PATH="${APPLICATION_BASE_PATH%/}/"
+    else
+      export NORMALIZED_BASE_PATH=""
+    fi
+    echo "✅ Base path normalized: '${APPLICATION_BASE_PATH}' -> '${NORMALIZED_BASE_PATH}'"
+
+# Template pour gérer le profil maven natif
+.manage-native-maven-profile: &manage_native_maven_profile
+  - |
+    if [ "${JAVA_NATIVE_BUILD}" == "true" ] && [ "${JAVA_NATIVE_DYNATRACE}" != "true" ]; then
+      echo "🔧 Enabling Maven native profile for native image build"
+      export MAVEN_BUILD_ADDITIONAL_BUILD_ARGUMENTS="-Pnative ${MAVEN_BUILD_ADDITIONAL_BUILD_ARGUMENTS}"
+    else
+      echo "🔧 Native image build not requested, skipping native profile activation"
+    fi
+    echo "✅ Maven profile set: '${MAVEN_BUILD_ADDITIONAL_BUILD_ARGUMENTS}' -> '${MAVEN_BUILD_ADDITIONAL_BUILD_ARGUMENTS}'"
 
 .build-rules: &build_rules
   rules:
-    - changes:
-        - .gitlab-ci.yml
-        - package.json
-        - src/**/*
-        - src/*
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
     - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     - if: $FORCE_DEV_DEPLOY == "true"
@@ -115,110 +104,69 @@ stages:
 .build:
   <<: *build_rules
 
-.npm-cache:
+.cache:
   cache:
-    key:
-      prefix: "${CI_PIPELINE_ID}-${CI_COMMIT_REF_SLUG}"
-      files:
-        - package-lock.json
+    key: "${CI_PIPELINE_ID}-${CI_COMMIT_REF_SLUG}"
     paths:
-      - node_modules
-      - dist
+    - .m2/repository
     policy: pull
 
-# =============================================================================
-# NPM SECURE INSTALL - Script réutilisable
-# =============================================================================
-.npm-secure-install:
-  script:
-    - echo "🔒 NPM Secure Install - Scripts globally disabled"
-    - echo "📋 Whitelist → ${NPM_SCRIPTS_WHITELIST}"
-    # Installation avec scripts bloqués (safe)
-    - npm ci --ignore-scripts
-    # Rebuild contrôlé uniquement pour les packages whitelistés présents
-    - |
-      echo "🔧 Rebuilding whitelisted packages..."
-      for pkg in ${NPM_SCRIPTS_WHITELIST}; do
-        if [ -d "node_modules/${pkg}" ]; then
-          echo "  ✅ Rebuilding: ${pkg}"
-          npm rebuild "${pkg}" 2>/dev/null || echo "  ⚠️ Rebuild skipped: ${pkg} (no native build needed)"
-        fi
-      done
-    # Détection de scripts non autorisés
-    - |
-      echo "🔍 Checking for unauthorized postinstall scripts..."
-      UNAUTHORIZED=""
-      for dir in node_modules/*/; do
-        if [ -d "${dir}" ]; then
-          pkg_name=$(basename "${dir}")
-          pkg_json="${dir}package.json"
-          if [ -f "${pkg_json}" ]; then
-            if grep -qE '"(pre|post)?install"' "${pkg_json}" 2>/dev/null; then
-              if ! echo " ${NPM_SCRIPTS_WHITELIST} " | grep -q " ${pkg_name} "; then
-                UNAUTHORIZED="${UNAUTHORIZED} ${pkg_name}"
-              fi
-            fi
-          fi
-        fi
-      done
-      # Check scoped packages (@org/pkg)
-      for org_dir in node_modules/@*/; do
-        if [ -d "${org_dir}" ]; then
-          for dir in ${org_dir}*/; do
-            if [ -d "${dir}" ]; then
-              pkg_name="@$(basename $(dirname ${dir}))/$(basename ${dir})"
-              pkg_json="${dir}package.json"
-              if [ -f "${pkg_json}" ]; then
-                if grep -qE '"(pre|post)?install"' "${pkg_json}" 2>/dev/null; then
-                  if ! echo " ${NPM_SCRIPTS_WHITELIST} " | grep -q " ${pkg_name} "; then
-                    UNAUTHORIZED="${UNAUTHORIZED} ${pkg_name}"
-                  fi
-                fi
-              fi
-            fi
-          done
-        fi
-      done
-      if [ -n "${UNAUTHORIZED}" ]; then
-        echo "❌ SECURITY VIOLATION: Unauthorized packages with install scripts detected:"
-        echo "${UNAUTHORIZED}" | tr ' ' '\n' | grep -v '^$' | sed 's/^/   🚫 /'
-        echo ""
-        echo "Ces packages ont des scripts d'installation mais ne sont pas dans la whitelist."
-        echo "→ Contacter l'équipe Platform pour demander une exception: #salsifi-support"
-        exit 1
+# Template pour factoriser l'authentification Maven
+.maven-auth-setup: &maven_auth_setup
+  - |
+    if [ ! -f "maven-certificates.pem" ]; then
+      echo "❌ maven-certificates.pem not found from prepare-config job"
+      exit 1
+    fi
+
+    echo "🔧 Importing GCP certificates into JVM truststore"
+    JAVA_HOME=$(readlink -f /usr/bin/java | sed "s:bin/java::")
+    CACERTS_PATH="$JAVA_HOME/lib/security/cacerts"
+    cp "$CACERTS_PATH" "$CACERTS_PATH.backup" || true
+    cert_count=0
+    csplit -f cert- maven-certificates.pem '/-----BEGIN CERTIFICATE-----/' '{*}' 2>/dev/null || true
+    for cert_file in cert-*; do
+      if [ -s "$cert_file" ] && grep -q "BEGIN CERTIFICATE" "$cert_file"; then
+        cert_count=$((cert_count + 1))
+        keytool -import -noprompt -trustcacerts \
+          -alias "gcp-cert-$cert_count" -file "$cert_file" \
+          -keystore "$CACERTS_PATH" -storepass changeit 2>/dev/null || true
       fi
-      echo "✅ NPM Security check passed"
+    done
+    rm -f cert-*
+    echo "✅ $cert_count certificates imported into JVM truststore"
 
-artifactregistry-login:
-  stage: .pre
-  variables:
-    GIT_STRATEGY: none
-  script:
-    - NPM_TOKEN=$(gcloud auth print-access-token)
-    - echo "NPM_TOKEN=$NPM_TOKEN" > npm-token.env
-  artifacts:
-    reports:
-      dotenv: npm-token.env
-  extends: .build
+    echo "🔧 Hiding Maven Wrapper to force system Maven"
+    test -f mvnw     && mv mvnw     mvnw.hidden     || true
+    test -f mvnw.cmd && mv mvnw.cmd mvnw.cmd.hidden || true
+    test -d .mvn     && mv .mvn     .mvn.hidden     || true
 
-npm-build:
-  stage: build
-  extends:
-    - .npm-cache
-    - .npm-secure-install
-    - .build
-  cache:
-    policy: pull-push
-  image: ${NODE_IMAGE}
+    echo "🔧 Configuring MAVEN_OPTS"
+    MAVEN_OPTS="-Dmaven.repo.local=.m2/repository"
+    MAVEN_OPTS="$MAVEN_OPTS -Dcom.sun.net.ssl.checkRevocation=false"  # CRL endpoints may be unreachable from CI
+    export MAVEN_OPTS
 
 pack-build:
+  extends: .build
   stage: build
-  extends:
-    - .npm-cache
-    - .build
+  rules:
+    - if: $JAVA_NATIVE_DYNATRACE == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $FORCE_DEV_DEPLOY == "true"
+    - when: never
   variables:
-    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: 2Gi
+    KUBERNETES_MEMORY_REQUEST: 4Gi
+    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: 4Gi
+    KUBERNETES_EPHEMERAL_STORAGE_LIMIT: 10Gi
   script:
+    - *normalize_base_path
+    - *manage_native_maven_profile
+    - echo "🧹 Cleaning Maven cache before build..."
+    - find .m2/repository -name "*.lastUpdated" -delete 2>/dev/null || true
+    - find .m2/repository -type f -mtime +30 -delete 2>/dev/null || true
+    - du -sh .m2/repository 2>/dev/null || echo "Maven cache directory does not exist yet"
     - echo "⚙️ Building with Cloud Build and buildpacks (inline configuration)"
     - echo "🏗️ Image = europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker/$IMAGE_NAME:$IMAGE_TAG"
     - |
@@ -227,30 +175,86 @@ pack-build:
       substitutions:
         _PACK_IMAGE: '${PACK_IMAGE}'
         _BP_BUILDER_IMAGE: '${BP_BUILDER_IMAGE}'
+        _BP_RUN_IMAGE: '${BP_RUN_IMAGE}'
         _BP_LIFECYCLE_IMAGE: '${BP_LIFECYCLE_IMAGE}'
         _IMAGE_REGISTRY: 'europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker'
         _IMAGE_NAME: '${IMAGE_NAME}'
         _IMAGE_TAG: '${IMAGE_TAG}'
-        _GCLOUD_IMAGE: '${GCLOUD_IMAGE}'
-        _NPM_REGISTRY: 'europe-west1-npm.pkg.dev/lcl-easypart-dev-73/npm-mirror/'
+        _CLOUD_SDK_IMAGE: '${CLOUD_SDK_IMAGE}'
+        _GCP_MAVEN_DOMAIN: 'europe-maven.pkg.dev'
+        _JAVA_VERSION: '${JAVA_VERSION}'
+        _BP_NATIVE_IMAGE_FLAG: '${JAVA_NATIVE_BUILD}'
+        _MAVEN_ADDITIONAL_BUILD_ARGUMENTS: '${MAVEN_BUILD_ADDITIONAL_BUILD_ARGUMENTS}'
+        _BP_MAVEN_BUILT_MODULE: '${BP_MAVEN_BUILT_MODULE}'
+        _MAVEN_KEY_STORE_PARAMS: '-Djavax.net.ssl.trustStore=${NORMALIZED_BASE_PATH}src/main/resources/keystore.p12 -Djavax.net.ssl.trustStorePassword=changeit -Djavax.net.ssl.trustStoreType=PKCS12 -Dcom.sun.net.ssl.checkRevocation=false -Dtrust_all_cert=true'
 
       steps:
         # Setup OAuth token and certificates with enhanced certificate handling
-        - name: '${_GCLOUD_IMAGE}'
-          id: 'NPM registry authentication'
+        - name: '${_CLOUD_SDK_IMAGE}'
+          id: 'Setup maven authentication and SSL certificates'
           entrypoint: 'bash'
           args:
             - '-c'
             - |
-              echo "Generating NPM token..."
-              NPM_TOKEN=$(gcloud auth print-access-token)
-              echo "registry=https://${_NPM_REGISTRY}" > /workspace/.npmrc
-              echo "//${_NPM_REGISTRY}:_authToken=$$NPM_TOKEN" >> /workspace/.npmrc
-              echo "always-auth=true" >> /workspace/.npmrc
+              set -e  # Exit on any error
+              
+              # Get GCP Maven repository certificates
+              openssl s_client -showcerts -connect ${_GCP_MAVEN_DOMAIN}:443 -servername ${_GCP_MAVEN_DOMAIN} < /dev/null 2>/dev/null | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' > gcp-maven-certs.pem
+              
+              # Get Google's root certificates
+              curl -s https://pki.goog/roots.pem >> gcp-maven-certs.pem 2>/dev/null || true
+              
+              # Find Java installation
+              JAVA_HOME=$$(readlink -f /usr/bin/java | sed "s:bin/java::")
+              CACERTS_PATH="$$JAVA_HOME/lib/security/cacerts"
+              CUSTOM_TRUSTSTORE="/workspace/src/main/resources/keystore.p12"
+              
+              # Backup original keystores
+              cp "$$CACERTS_PATH" "$$CACERTS_PATH.backup" || true
+              
+              # Import certificates into system truststore
+              csplit -f cert- gcp-maven-certs.pem '/-----BEGIN CERTIFICATE-----/' '{*}' 2>/dev/null || true
+              
+              cert_count=0
+              for cert_file in cert-*; do
+                if [ -s "$$cert_file" ] && grep -q "BEGIN CERTIFICATE" "$$cert_file"; then
+                  cert_count=$$((cert_count + 1))
+                  # Import to system truststore
+                  keytool -import -noprompt -trustcacerts -alias "gcp-cert-$$cert_count" -file "$$cert_file" -keystore "$$CACERTS_PATH" -storepass changeit 2>/dev/null || true
+                  # Also import to custom truststore if it exists
+                  if [ -f "$$CUSTOM_TRUSTSTORE" ]; then
+                    keytool -import -noprompt -trustcacerts -alias "gcp-cert-$$cert_count" -file "$$cert_file" -keystore "$$CUSTOM_TRUSTSTORE" -storepass changeit 2>/dev/null || true
+                  fi
+                fi
+              done
+              
+              # Test connectivity to Maven repository
+              timeout 30s openssl s_client -connect ${_GCP_MAVEN_DOMAIN}:443 -servername ${_GCP_MAVEN_DOMAIN} -verify 8 < /dev/null || echo "⚠️  Certificate verification test completed"
+              
+              # Generate OAuth token and inject into settings.xml
+              OAUTH_TOKEN=$$(gcloud auth print-access-token)
+              
+              # Replace the $$OAUTH_TOKEN placeholder with the actual token
+              sed -i "s/\$$\$$OAUTH_TOKEN/$$OAUTH_TOKEN/g" settings.xml
+              
+              # Clean up certificate files
+              rm -f cert-* gcp-maven-certs.pem
+
+        # Hide Maven Wrapper files to force system Maven usage
+        - name: '${_CLOUD_SDK_IMAGE}'
+          id: 'Hide Maven Wrapper'
+          entrypoint: 'bash'
+          args:
+            - '-c'
+            - |
+              echo "🔧 Temporarily hiding Maven Wrapper to force system Maven usage"
+              test -f mvnw && mv mvnw mvnw.hidden || true
+              test -f mvnw.cmd && mv mvnw.cmd mvnw.cmd.hidden || true  
+              test -d .mvn && mv .mvn .mvn.hidden || true
 
         # Build with pack
         - name: '${_PACK_IMAGE}'
-          id: 'Build with Buildpacks'
+          id: 'Build with buildpacks'
           env:
             - 'DOCKER_API_VERSION=1.41'
           args:
@@ -264,24 +268,45 @@ pack-build:
             - '${_BP_BUILDER_IMAGE}'
             - '--lifecycle-image'
             - '${_BP_LIFECYCLE_IMAGE}'
+            - '--run-image'
+            - '${_BP_RUN_IMAGE}'
+            - '--trust-builder'
+            - '--cache-image'
+            - '${_IMAGE_REGISTRY}/${_IMAGE_NAME}-cache:latest'
             - '--env'
-            - 'NPM_CONFIG_REGISTRY=https://${_NPM_REGISTRY}'
+            - 'BP_EMBED_CERTS=true'
             - '--env'
-            - 'NPM_CONFIG_//${_NPM_REGISTRY}:_authToken=$$NPM_TOKEN'
+            - 'BP_MAVEN_BUILT_MODULE=${_BP_MAVEN_BUILT_MODULE}'
             - '--env'
-            - 'NPM_CONFIG_LEGACY_PEER_DEPS=true'
+            - 'BP_JVM_VERSION=${_JAVA_VERSION}'
             - '--env'
-            - 'NPM_CONFIG_IGNORE_SCRIPTS=true'
-            - '--clear-cache'
+            - 'BP_MAVEN_BUILD_ARGUMENTS=package ${_MAVEN_ADDITIONAL_BUILD_ARGUMENTS} ${_MAVEN_KEY_STORE_PARAMS} -Dmaven.test.skip=true -Dfmt.skip=true -Dspotless.check.skip=true --no-transfer-progress --settings settings.xml'
+            - '--env'
+            - 'BP_NATIVE_IMAGE=${_BP_NATIVE_IMAGE_FLAG}'
+            - '--env'
+            - 'BP_MAVEN_DAEMON_ENABLED=false'
+            - '--env'
+            - 'BP_NATIVE_IMAGE_BUILD_ARGUMENTS=--no-fallback -J-Xmx16g -J-XX:MaxDirectMemorySize=1g -H:+AddAllCharsets -H:+RemoveUnusedSymbols --static --libc=musl'
+            - '--env'
+            - 'MAVEN_OPTS=-Xmx16g -XX:MaxDirectMemorySize=1g'
+            - '--publish'
             - '--report-output-dir'
             - '.'
 
-      images: '${_IMAGE_REGISTRY}/${_IMAGE_NAME}:${_IMAGE_TAG}'
+        # Pull image back locally so Cloud Build can reference it in images: for SLSA attestation
+        - name: 'gcr.io/cloud-builders/docker'
+          id: 'Pull image for SLSA attestation'
+          args:
+            - 'pull'
+            - '${_IMAGE_REGISTRY}/${_IMAGE_NAME}:${_IMAGE_TAG}'
+
+      images:
+        - '${_IMAGE_REGISTRY}/${_IMAGE_NAME}:${_IMAGE_TAG}'
 
       options:
         env:
           - 'DOCKER_BUILDKIT=1'
-        machineType: 'E2_HIGHCPU_8'
+        machineType: 'E2_HIGHCPU_32'
         requestedVerifyOption: VERIFIED
         substitutionOption: 'ALLOW_LOOSE'
         
@@ -290,7 +315,7 @@ pack-build:
     - gcloud --project=${GCP_PROJECT_ID} builds submit
         --config cloudbuild-inline.yaml --region ${LCL_REGION}
         --default-buckets-behavior=regional-user-owned-bucket
-        --substitutions=_PACK_IMAGE=${PACK_IMAGE},_GCLOUD_IMAGE=${GCLOUD_IMAGE},_BP_BUILDER_IMAGE=${BP_BUILDER_IMAGE},_BP_LIFECYCLE_IMAGE=${BP_LIFECYCLE_IMAGE},_IMAGE_NAME=${IMAGE_NAME},_IMAGE_TAG=${IMAGE_TAG},_IMAGE_REGISTRY=europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker
+        --substitutions=_PACK_IMAGE="${PACK_IMAGE},_CLOUD_SDK_IMAGE=${CLOUD_SDK_IMAGE},_BP_BUILDER_IMAGE=${BP_BUILDER_IMAGE},_BP_LIFECYCLE_IMAGE=${BP_LIFECYCLE_IMAGE},_BP_RUN_IMAGE=${BP_RUN_IMAGE},_IMAGE_NAME=${IMAGE_NAME},_IMAGE_TAG=${IMAGE_TAG},_IMAGE_REGISTRY=europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker,_JAVA_VERSION=${JAVA_VERSION},_BP_NATIVE_IMAGE_FLAG=${JAVA_NATIVE_BUILD},_MAVEN_ADDITIONAL_BUILD_ARGUMENTS=${MAVEN_BUILD_ADDITIONAL_BUILD_ARGUMENTS},_BP_MAVEN_BUILT_MODULE=${BP_MAVEN_BUILT_MODULE}"
     - echo "📄 Extracting image digest..."
     - |
       # Extract digest using gcloud
@@ -304,14 +329,119 @@ pack-build:
       echo "✅ Using digest: $DIGEST"
     - echo "🧹 Cleaning up temporary Cloud Build config"
     - rm -f cloudbuild-inline.yaml
+  cache: {}
   artifacts:
     reports:
       dotenv: digest.env
+
+native-dynatrace-build:
+  stage: build
+  variables:
+    KUBERNETES_MEMORY_REQUEST: 4Gi
+    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: 4Gi
+    KUBERNETES_EPHEMERAL_STORAGE_LIMIT: 10Gi
+  needs:
+    - job: prepare-config
+      artifacts: true
+  script:
+    - echo "Image = europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker/$IMAGE_NAME:$IMAGE_TAG"
+    - |
+      cat << 'DOCKERFILE_EOF' > Dockerfile.native-dynatrace
+      ARG MAVEN_IMAGE
+      ARG NATIVE_BUILD_IMAGE
+      ARG NATIVE_RUN_IMAGE
+      FROM ${MAVEN_IMAGE} AS maven
+      FROM ${NATIVE_BUILD_IMAGE} AS build
+      ARG CI_PROJECT_NAME
+      COPY --from=maven /usr/share/maven /opt/maven
+      ENV PATH="/opt/maven/bin:${PATH}"
+      WORKDIR /build
+      COPY . .
+      RUN --mount=type=secret,id=mvnsettings,target=/build/settings-ci.xml \
+          mvn -B -ntp -DskipTests -Pnative -Pdynatrace-native \
+              --settings /build/settings-ci.xml package native:compile-no-fork
+      RUN set -eu; \
+          actual=$(stat -c %s ./target/${CI_PROJECT_NAME} 2>/dev/null || echo 0); \
+          [ "$actual" -gt 52428800 ] || { echo "Binary too small or missing (${actual} bytes) - native compile failed"; exit 1; }; \
+          echo "Binary validated: ${actual} bytes"; \
+          install -D -m 0755 ./target/${CI_PROJECT_NAME} /out/application; \
+          cp -r ./target/dynatrace /out/dynatrace
+      FROM ${NATIVE_RUN_IMAGE} AS runtime
+      WORKDIR /workspace
+      COPY --from=build /out/application /workspace/application
+      COPY --from=build /out/dynatrace /workspace/dynatrace
+      USER 1000
+      ENTRYPOINT ["/workspace/application"]
+      DOCKERFILE_EOF
+    - |
+      cat << 'EOF' > cloudbuild-inline.yaml
+      substitutions:
+        _IMAGE_REGISTRY: 'europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker'
+        _IMAGE_NAME: '${IMAGE_NAME}'
+        _IMAGE_TAG: '${IMAGE_TAG}'
+        _MAVEN_IMAGE: '${MAVEN_IMAGE}'
+        _NATIVE_BUILD_IMAGE: '${NATIVE_BUILD_IMAGE}'
+        _NATIVE_RUN_IMAGE: '${NATIVE_RUN_IMAGE}'
+      steps:
+        - name: 'gcr.io/cloud-builders/docker'
+          id: 'Build native image with Dynatrace agent'
+          entrypoint: 'bash'
+          args:
+            - '-c'
+            - |
+              set -e
+              docker build \
+                --build-arg MAVEN_IMAGE=${_MAVEN_IMAGE} \
+                --build-arg NATIVE_BUILD_IMAGE=${_NATIVE_BUILD_IMAGE} \
+                --build-arg NATIVE_RUN_IMAGE=${_NATIVE_RUN_IMAGE} \
+                --build-arg CI_PROJECT_NAME=${_CI_PROJECT_NAME} \
+                --secret id=mvnsettings,src=settings-configured.xml \
+                -f Dockerfile.native-dynatrace \
+                -t ${_IMAGE_REGISTRY}/${_IMAGE_NAME}:${_IMAGE_TAG} \
+                -t ${_IMAGE_REGISTRY}/${_IMAGE_NAME}:latest \
+                .
+              docker push ${_IMAGE_REGISTRY}/${_IMAGE_NAME}:${_IMAGE_TAG}
+              docker push ${_IMAGE_REGISTRY}/${_IMAGE_NAME}:latest
+      images:
+        - '${_IMAGE_REGISTRY}/${_IMAGE_NAME}:${_IMAGE_TAG}'
+      options:
+        env:
+          - 'DOCKER_BUILDKIT=1'
+        machineType: 'E2_HIGHCPU_32'
+        requestedVerifyOption: VERIFIED
+        substitutionOption: 'ALLOW_LOOSE'
+      timeout: '3600s'
+      EOF
+    - gcloud --project=${GCP_PROJECT_ID} builds submit
+        --config cloudbuild-inline.yaml --region ${LCL_REGION}
+        --default-buckets-behavior=regional-user-owned-bucket
+        --substitutions=_IMAGE_NAME=${IMAGE_NAME},_IMAGE_TAG=${IMAGE_TAG},_IMAGE_REGISTRY=europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker,_MAVEN_IMAGE=${MAVEN_IMAGE},_NATIVE_BUILD_IMAGE=${NATIVE_BUILD_IMAGE},_NATIVE_RUN_IMAGE=${NATIVE_RUN_IMAGE},_CI_PROJECT_NAME=${CI_PROJECT_NAME}
+    - |
+      IMAGE_FULL_NAME="europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker/$IMAGE_NAME:$IMAGE_TAG"
+      DIGEST=$(gcloud container images describe $IMAGE_FULL_NAME --format='value(image_summary.digest)' 2>/dev/null || echo "")
+      echo "DIGEST=@${DIGEST}" | tee digest.env
+      echo "TAG=:${IMAGE_TAG}" | tee -a digest.env
+      echo "IMAGE_FULL_NAME=${IMAGE_FULL_NAME}" | tee -a digest.env
+    - rm -f cloudbuild-inline.yaml Dockerfile.native-dynatrace
+  cache: {}
+  artifacts:
+    reports:
+      dotenv: digest.env
+  rules:
+    - if: $JAVA_NATIVE_DYNATRACE != "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $FORCE_DEV_DEPLOY == "true"
+    - when: never
 
 sign-build:
   stage: build
   needs:
     - job: pack-build
+      optional: true
+      artifacts: true
+    - job: native-dynatrace-build
       optional: true
       artifacts: true
   variables:
@@ -329,12 +459,12 @@ sign-build:
         _IMAGE_TAG: '${IMAGE_TAG}'
         _DIGEST: '${DIGEST}'
         _COSIGN_IMAGE: '${COSIGN_IMAGE}'
-        _GCLOUD_IMAGE: '${GCLOUD_IMAGE}'
+        _CLOUD_SDK_IMAGE: '${CLOUD_SDK_IMAGE}'
         _LCL_PROJECT_ID: '${LCL_PROJECT_ID}'
         _LCL_PROJECT_NAME: '${LCL_PROJECT_NAME}'
 
       steps:
-        - name: '${_GCLOUD_IMAGE}'
+        - name: '${_CLOUD_SDK_IMAGE}'
           id: 'Upload SBOM to Artifact Registry'
           entrypoint: 'bash'
           args:
@@ -380,45 +510,94 @@ sign-build:
     - gcloud --project=${GCP_PROJECT_ID} builds submit
         --config cloudbuild-inline.yaml --region ${LCL_REGION}
         --service-account=projects/${GCP_PROJECT_ID}/serviceAccounts/cloudbuild@${GCP_PROJECT_ID}.iam.gserviceaccount.com
-        --substitutions=_GCLOUD_IMAGE=${GCLOUD_IMAGE},_IMAGE_NAME=${IMAGE_NAME},_DIGEST=${DIGEST},_IMAGE_TAG=${IMAGE_TAG},_IMAGE_REGISTRY=europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker,_COSIGN_IMAGE=${COSIGN_IMAGE},_LCL_PROJECT_ID=${LCL_PROJECT_ID},_LCL_PROJECT_NAME=${LCL_PROJECT_NAME}
+        --substitutions=_CLOUD_SDK_IMAGE=${CLOUD_SDK_IMAGE},_IMAGE_NAME=${IMAGE_NAME},_DIGEST=${DIGEST},_IMAGE_TAG=${IMAGE_TAG},_IMAGE_REGISTRY=europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker,_COSIGN_IMAGE=${COSIGN_IMAGE},_LCL_PROJECT_ID=${LCL_PROJECT_ID},_LCL_PROJECT_NAME=${LCL_PROJECT_NAME}
     - rm -f cloudbuild-inline.yaml
 
-test:
-  extends: .npm-cache
-  stage: test
-  needs: ['npm-build']
-  image: ${NODE_IMAGE}
+maven-install:
+  extends: .cache
+  cache:
+    policy: pull-push
+  stage: build
+  needs: ["prepare-config"]
+  image: ${MAVEN_IMAGE}
   script:
-    - |
-      echo "🧪 Running tests with vitest"
-      npm run test:cov
+    - echo "📁 Copying built artifact from previous job"
+    - *normalize_base_path
+    - *manage_native_maven_profile
+    - echo "🧪 Running Maven install with prepared configuration"
+    - *maven_auth_setup
+    - mvn install --settings settings-configured.xml -Dfmt.skip=true -Dspotless.check.skip=true ${MAVEN_BUILD_ADDITIONAL_BUILD_ARGUMENTS}
   artifacts:
+    paths:
+      - target/
+      - target/classes/
+      - ${NORMALIZED_BASE_PATH}target/
+      - ${NORMALIZED_BASE_PATH}target/classes/
     when: always
     expire_in: 1 week
-    paths:
-      - coverage
 
-bruno:
-  extends: .npm-cache
-  stage: test
-  needs: ['npm-build']
-  image: ${BRUNO_IMAGE}
+prepare-config:
+  extends: .build
+  stage: build
+  image: ${CLOUD_SDK_IMAGE}
   script:
     - |
-      echo "🧪 Running tests with bruno"
-      bru --version
-      cd bruno-test
-      bru run
+      set -e
+      echo "🔧 Fetching GCP Artifact Registry SSL certificates"
+      openssl s_client -showcerts \
+        -connect ${GCP_MAVEN_DOMAIN}:443 -servername ${GCP_MAVEN_DOMAIN} \
+        < /dev/null 2>/dev/null \
+        | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' > maven-certificates.pem
+      curl -sf https://pki.goog/roots.pem >> maven-certificates.pem || true
+      echo "✅ Certificates saved to maven-certificates.pem"
+
+      echo "🔧 Generating OAuth token and configuring Maven settings"
+      OAUTH_TOKEN=$(gcloud auth print-access-token)
+      sed "s/\$\$OAUTH_TOKEN/$OAUTH_TOKEN/g" settings.xml > settings-configured.xml
+      echo "✅ settings-configured.xml ready"
+  artifacts:
+    paths:
+      - settings-configured.xml
+      - maven-certificates.pem
+    expire_in: 1 hour
+
+test:
+  extends: .build
+  stage: test
+  needs: ["prepare-config", "maven-install"]
+  image: ${MAVEN_IMAGE}
+  script:
+    - echo "🧪 Running tests with prepared Maven configuration"
+    - *maven_auth_setup
+    - echo "🚀 Running Maven test"
+    - mvn test --settings settings-configured.xml -Dfmt.skip=true -Dspotless.check.skip=true ${MAVEN_TEST_ADDITIONAL_BUILD_ARGUMENTS}
+  artifacts:
+    reports:
+      junit:
+        - ${NORMALIZED_BASE_PATH}target/surefire-reports/TEST-*.xml
+    paths:
+      - ${NORMALIZED_BASE_PATH}target/
+      - ${NORMALIZED_BASE_PATH}target/site/
+      - ${NORMALIZED_BASE_PATH}target/site/jacoco/
+      - ${NORMALIZED_BASE_PATH}target/surefire-reports/
+      - ${NORMALIZED_BASE_PATH}target/classes/
+      - ${NORMALIZED_BASE_PATH}target/test-classes/
+    when: always
+    expire_in: 1 week
 
 sonar:
   <<: *build_rules
   stage: quality
-  needs: ['test']
+  extends: .cache
+  cache:
+    policy: pull
+  needs: ["prepare-config", "test", "maven-install"]
   image: ${SONAR_IMAGE}
   variables:
-    APP_BASE_NAME: '${CI_PROJECT_NAME}'
-    GIT_DEPTH: 0 # Tells git to fetch all the branches of the project, required by the analysis task
+    APP_BASE_NAME: "${CI_PROJECT_NAME}"
+    GIT_DEPTH: 0  # Tells git to fetch all the branches of the project, required by the analysis task
   script:
+    - *normalize_base_path
     - echo "🔍 Starting SonarQube LCL analysis with external server"
     - echo "🌐 Using SonarQube server ${SONAR_URL}"
     - echo "CI_PROJECT_NAME=$CI_PROJECT_NAME"
@@ -447,10 +626,8 @@ sonar:
         echo "✅ Variables resolved in existing file"
         echo "📋 Updated content preview:"
         head -5 sonar-project.properties || echo "  Unable to preview updated content"
-
+        
       else
-      
-        # Create file if it doesn't exist or was removed due to validation issues
         echo "📝 Creating SonarQube LCL configuration"
         cat > sonar-project.properties << EOF
       sonar.host.url=${SONAR_URL}
@@ -458,22 +635,21 @@ sonar:
       sonar.sourceEncoding=UTF-8
       sonar.projectKey=com.lcl.${SONAR_PROJECT_CODE}.${APP_BASE_NAME}
       sonar.projectName=${APP_BASE_NAME}
-      sonar.sources=src
-      sonar.exclusions=**/*.test.ts,**/node_modules/**,**/dist/**
-      sonar.coverage.exclusions=**/*.dto.ts,**/*.enum.ts,**/*.interface.ts,**/*.model.ts,**/*.value-object.ts,**/index.ts,src/app/health/**,src/app/content/**,src/app/info/**
-      sonar.javascript.lcov.reportPaths=coverage/lcov.info
+      sonar.sources=${NORMALIZED_BASE_PATH}src/main/java
+      sonar.tests=${NORMALIZED_BASE_PATH}src/test/java
+      sonar.java.binaries=${NORMALIZED_BASE_PATH}target/classes
+      # sonar.java.test.binaries=${NORMALIZED_BASE_PATH}target/test-classes
+      sonar.coverage.jacoco.xmlReportPaths=${NORMALIZED_BASE_PATH}target/site/jacoco/jacoco.xml
+      sonar.junit.reportPaths=${NORMALIZED_BASE_PATH}target/surefire-reports
+      sonar.java.source=${JAVA_VERSION}
+      sonar.exclusions=**/*Test.java,**/*Tests.java
       EOF
       fi
-
+      
     - |
       echo "🚀 Running SonarQube analysis"
-      sonar-scanner -Dproject.settings=sonar-project.properties -Dsonar.qualitygate.wait=true
-      SCAN_EXIT_CODE=$?
-      echo "🔎 sonar-scanner exit code: $SCAN_EXIT_CODE"
-      if [ $SCAN_EXIT_CODE -ne 0 ]; then
-        echo "❌ SonarQube scan failed or Quality Gate not passed (exit code $SCAN_EXIT_CODE)"
-        exit $SCAN_EXIT_CODE
-      fi
+      sonar-scanner -Dproject.settings=sonar-project.properties
+    - |
       echo "✅ SonarQube HTML report generated at sonar-report.html"
       echo "📊 SonarQube analysis completed successfully"
       if [ "$CI_PIPELINE_SOURCE" == "merge_request_event" ]; then
@@ -483,89 +659,34 @@ sonar:
       fi
   tags:
     - buildpacks
+  allow_failure: true
 
 trivy-scan:
   extends: .trivy-scan-template
   <<: *build_rules
-  needs: ["pack-build", "test"]
+  needs:
+    - job: pack-build
+      optional: true
+      artifacts: true
+    - job: native-dynatrace-build
+      optional: true
+      artifacts: true
+    - job: test
 
 lint:
   <<: *build_rules
   stage: quality
-  extends: .npm-cache
-  needs: ['npm-build', 'test']
-  image: ${NODE_IMAGE}
-  script:
-    - echo "🔍 Running ESLint analysis on TypeScript/JavaScript files"
-    - |
-      # Run ESLint and capture output
-      echo "📝 Analyzing code with ESLint..."
-      ESLINT_EXIT_CODE=0
-
-      # First generate JSON report with direct command
-      ./node_modules/.bin/eslint "{src,apps,libs,test}/**/*.ts" --format json --output-file eslint-results.json 2>&1 || ESLINT_EXIT_CODE=$?
-      # Then generate stylish report
-      ./node_modules/.bin/eslint "{src,apps,libs,test}/**/*.ts" --format stylish > eslint-report.txt 2>&1 || true
-
-      echo "📋 ESLint exit code: $ESLINT_EXIT_CODE"
-      echo "📁 Files generated:"
-      ls -la eslint-*.json eslint-*.txt 2>/dev/null || echo "  No eslint output files found"
-
-      # Display results in console
-      echo "📊 ESLint Results:"
-      if [ -s eslint-report.txt ]; then
-        echo "✅ ESLint results file found"
-        echo ""
-        
-        # Count files and issues more accurately
-        TOTAL_FILES_IN_PROJECT=$(find src -name "*.ts" 2>/dev/null | wc -l | tr -d ' ')
-        TOTAL_FILES_WITH_ISSUES=$(grep -c ".ts" eslint-report.txt 2>/dev/null || echo "0")
-        TOTAL_ERRORS=$(grep -c "error" eslint-report.txt 2>/dev/null || echo "0")
-        TOTAL_WARNINGS=$(grep -c "warning" eslint-report.txt 2>/dev/null || echo "0")
-        TOTAL_ERRORS=$((TOTAL_ERRORS - 1))
-        TOTAL_WARNINGS=$((TOTAL_WARNINGS - 1))
-        
-        echo "  📁 Files in project: $TOTAL_FILES_IN_PROJECT"
-        echo "  📄 Files with issues: $TOTAL_FILES_WITH_ISSUES"
-        echo "  ❌ Errors: $TOTAL_ERRORS"
-        echo "  ⚠️ Warnings: $TOTAL_WARNINGS"
-        
-        # Check results and exit appropriately
-        if [ $TOTAL_ERRORS -gt 0 ]; then
-          echo ""
-          echo "❌ ESLint found $TOTAL_ERRORS error(s) that must be fixed:"
-          echo "----------------------------------------"
-          if [ -f eslint-report.txt ]; then
-            cat eslint-report.txt
-          else
-            echo "⚠️ No detailed report available"
-          fi
-          echo "----------------------------------------"
-          echo "❌ ESLint analysis failed - please fix the errors above"
-          exit 1
-        elif [ $TOTAL_WARNINGS -gt 0 ]; then
-          echo ""
-          echo "⚠️  ESLint found $TOTAL_WARNINGS warning(s):"
-          echo "----------------------------------------"
-          if [ -f eslint-report.txt ]; then
-            cat eslint-report.txt
-          else
-            echo "⚠️ No detailed report available"
-          fi
-          echo "----------------------------------------"
-          echo "✅ ESLint analysis completed with warnings - no blocking errors"
-        else
-          echo "✅ ESLint analysis completed successfully - no errors or warnings found"
-        fi
-      else
-        echo "✅ ESLint analysis completed successfully - no errors or warnings found"
-      fi
-  artifacts:
-    when: always
-    expire_in: 1 week
+  image: ${MAVEN_IMAGE}
+  needs: ["prepare-config", "test"]
+  cache:
+    key: "${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}"
     paths:
-      - eslint-results.json
-      - eslint-report.txt
+      - .m2/repository
+    policy: pull
+  script:
+    - echo "🔍 Running code linting with Spotless"
+    - *maven_auth_setup
+    - mvn spotless:check --settings settings-configured.xml -Dfmt.skip=true
   allow_failure: true
 
 # =============================================================================
@@ -616,142 +737,30 @@ gitleaks:
       - gitleaks-history-report.json
 
 # =============================================================================
-# NPM COOLDOWN - Quarantaine des packages récemment publiés (anti supply chain)
-# =============================================================================
-cooldown-scan:
-  <<: *build_rules
-  stage: test
-  image: ${NODE_IMAGE}
-  needs: []
-  script:
-    - echo "🧊 NPM Cooldown - Quarantaine des packages récemment publiés"
-    - echo "⏳ Fenêtre de cooldown → ${NPM_COOLDOWN_DAYS} jours (registre ${NPM_COOLDOWN_REGISTRY})"
-    - |
-      cat > /tmp/cooldown-check.js << 'COOLDOWN_EOF'
-      const fs = require('fs');
-      const { exec } = require('child_process');
-
-      const DAYS = parseInt(process.env.NPM_COOLDOWN_DAYS || '7', 10);
-      const REGISTRY = process.env.NPM_COOLDOWN_REGISTRY || 'https://registry.npmjs.org';
-      const ALLOW = new Set((process.env.NPM_COOLDOWN_ALLOWLIST || '').split(/\s+/).filter(Boolean));
-      const BLOCKING = (process.env.BLOCKING_COOLDOWN_SCAN || 'true') === 'true';
-      const NOW = Date.now();
-      const WINDOW = DAYS * 86400 * 1000;
-
-      if (!fs.existsSync('package-lock.json')) {
-        console.log('⚠️ package-lock.json introuvable - cooldown ignoré');
-        process.exit(0);
-      }
-      const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
-
-      // name -> Set(version) : couvre les dépendances directes ET transitives
-      const wanted = new Map();
-      const add = (name, version) => {
-        if (!name || !version || ALLOW.has(name)) return;
-        if (!wanted.has(name)) wanted.set(name, new Set());
-        wanted.get(name).add(version);
-      };
-      // lockfile v2/v3 : objet "packages" indexé par chemin node_modules
-      for (const [p, meta] of Object.entries(lock.packages || {})) {
-        if (!p) continue; // racine du projet
-        add(p.split('node_modules/').pop(), meta && meta.version);
-      }
-      // lockfile v1 : arbre "dependencies"
-      const walk = (deps) => {
-        for (const [name, meta] of Object.entries(deps || {})) {
-          add(name, meta.version);
-          if (meta.dependencies) walk(meta.dependencies);
-        }
-      };
-      walk(lock.dependencies);
-
-      const names = [...wanted.keys()];
-      console.log(`🔎 ${names.length} packages uniques à vérifier`);
-
-      const times = (name) => new Promise((resolve) => {
-        exec(`npm view ${JSON.stringify(name)} time --json --registry ${REGISTRY}`,
-          { maxBuffer: 20 * 1024 * 1024 },
-          (err, stdout) => {
-            if (err) return resolve(null);
-            try { resolve(JSON.parse(stdout)); } catch { resolve(null); }
-          });
-      });
-
-      const pool = async (items, size, fn) => {
-        let i = 0;
-        const worker = async () => { while (i < items.length) { const idx = i++; await fn(items[idx]); } };
-        await Promise.all(Array.from({ length: size }, worker));
-      };
-
-      (async () => {
-        const offenders = [];
-        const unresolved = [];
-        await pool(names, 10, async (name) => {
-          const t = await times(name);
-          if (!t) { unresolved.push(name); return; }
-          for (const v of wanted.get(name)) {
-            const published = t[v] ? Date.parse(t[v]) : NaN;
-            if (isNaN(published)) continue;
-            const ageMs = NOW - published;
-            if (ageMs < WINDOW) {
-              offenders.push({ name, version: v, ageDays: +(ageMs / 86400000).toFixed(1), published: t[v] });
-            }
-          }
-        });
-
-        if (unresolved.length) {
-          console.log(`⚠️ ${unresolved.length} packages non résolus sur le registre (ignorés): ${unresolved.slice(0, 10).join(', ')}${unresolved.length > 10 ? '…' : ''}`);
-        }
-
-        if (offenders.length) {
-          console.log(`❌ SECURITY VIOLATION: ${offenders.length} package(s) publié(s) il y a moins de ${DAYS} jours :`);
-          for (const o of offenders.sort((a, b) => a.ageDays - b.ageDays)) {
-            console.log(`   🧊 ${o.name}@${o.version} (publié il y a ${o.ageDays}j, le ${o.published})`);
-          }
-          console.log('');
-          console.log('Une version très récente peut être une compromission non encore détectée.');
-          console.log('→ Attendez la fin du cooldown, épinglez une version antérieure,');
-          console.log('  ou ajoutez le package à NPM_COOLDOWN_ALLOWLIST après revue.');
-          console.log('→ Contacter l\'équipe Platform: #salsifi-support');
-          fs.writeFileSync('cooldown-report.json', JSON.stringify(offenders, null, 2));
-          if (BLOCKING) process.exit(1);
-          console.log('⚠️ Scan non-bloquant (BLOCKING_COOLDOWN_SCAN=false) - poursuite du pipeline');
-          process.exit(0);
-        }
-        fs.writeFileSync('cooldown-report.json', '[]');
-        console.log('✅ Aucun package en période de cooldown');
-      })();
-      COOLDOWN_EOF
-      node /tmp/cooldown-check.js
-  artifacts:
-    when: always
-    expire_in: 1 week
-    paths:
-      - cooldown-report.json
-
-# =============================================================================
 # LICENCES OPEN SOURCE - Conformité (ACDC-859)
 # =============================================================================
-# Scan Trivy (--scanners license). Classification par catégories natives Trivy
-# (forbidden -> CRITICAL bloquant, restricted -> HIGH tracé). Blocage différencié
-# par branche + SBOM CycloneDX.
-# NB1 : le scanner de licences utilise le classifier embarqué → pas besoin de la
-#       DB de vulns (--skip-db-update), ce qui évite aussi tout egress ghcr.io.
-# NB2 : la policy est écrite INLINE (heredoc) et non committée, car le composant
-#       tourne dans le checkout du projet consommateur qui n'a pas ce fichier —
-#       même principe que le .trivyignore de component/trivy-scan.yml.
+# Scan Trivy (--scanners license) sur les dépendances Maven. Classification par
+# catégories natives Trivy (forbidden -> CRITICAL bloquant, restricted -> HIGH
+# tracé). Blocage différencié par branche + SBOM CycloneDX.
+# NB1 : le scanner de licences utilise le classifier embarqué → --skip-db-update.
+# NB2 : policy écrite INLINE (heredoc), comme le .trivyignore du composant Trivy,
+#       car le job tourne dans le checkout du projet consommateur.
+# NB3 : SCAN_PATH="." + cache .m2 pull (needs maven-install) pour que Trivy voie
+#       les JAR des dépendances et en lise les licences.
 .license-base:
   stage: quality
-  extends: .npm-cache
-  needs: ['npm-build'] # node_modules requis : Trivy lit les licences des packages installés
+  extends: .cache
+  needs: ["maven-install"]
   image:
     name: ${TRIVY_IMAGE}
     entrypoint: [""]
   variables:
-    # Config dédiée (PAS trivy.yaml, sinon auto-chargée par le job trivy-scan d'image)
     TRIVY_CONFIG: trivy-license.yaml
+    TRIVY_TIMEOUT: 15m0s
+    TRIVY_NO_PROGRESS: "true"
+    SCAN_PATH: "."
   before_script:
-    - echo "⚖️ Trivy - Scan de conformité des licences OSS"
+    - echo "⚖️ Trivy - Scan de conformité des licences OSS (Maven)"
     - |
       # Policy de licences écrite inline (indisponible dans le repo consommateur)
       cat > trivy-license.yaml << 'TRIVY_LIC_EOF'
@@ -787,9 +796,8 @@ cooldown-scan:
           - BSD-3-Clause
           - ISC
       TRIVY_LIC_EOF
-    # Rapport lisible + SBOM CycloneDX, toujours produits
-    - trivy fs --scanners license --skip-db-update --format table --output license-report.txt .
-    - trivy fs --scanners license --skip-db-update --format cyclonedx --output license-sbom.cdx.json .
+    - trivy fs --scanners license --skip-db-update --format table --output license-report.txt "${SCAN_PATH}"
+    - trivy fs --scanners license --skip-db-update --format cyclonedx --output license-sbom.cdx.json "${SCAN_PATH}"
   artifacts:
     when: always
     expire_in: 30 days
@@ -804,7 +812,7 @@ license-check-blocking:
   extends: .license-base
   script:
     - echo "🔒 Gate bloquant - echec si licence forbidden detectee (GPL/AGPL/SSPL/EUPL)"
-    - trivy fs --scanners license --skip-db-update --severity CRITICAL --exit-code 1 .
+    - trivy fs --scanners license --skip-db-update --severity CRITICAL --exit-code 1 "${SCAN_PATH}"
     - echo "✅ Aucune licence interdite détectée"
   rules:
     - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -816,7 +824,7 @@ license-check-warn:
   extends: .license-base
   script:
     - echo "⚠️ Gate non bloquant (MR/feature) - licences interdites signalées sans casser la pipeline"
-    - trivy fs --scanners license --skip-db-update --severity CRITICAL,HIGH --exit-code 0 .
+    - trivy fs --scanners license --skip-db-update --severity CRITICAL,HIGH --exit-code 0 "${SCAN_PATH}"
   allow_failure: true
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -839,7 +847,7 @@ flux:
     - flux push artifact
       oci://europe-docker.pkg.dev/${GCP_PROJECT_ID}/oci-dev/${CI_PROJECT_NAME}
       --source="${CI_PROJECT_URL}"
-      --revision="${CI_COMMIT_REF_NAME}@sha1:${CI_COMMIT_SHA}"
+      --revision="${CI_COMMIT_REF_SLUG}@sha1:${CI_COMMIT_SHA}"
       --path .
       --reproducible
       --provider gcp
@@ -852,15 +860,19 @@ flux:
       dotenv: flux_digest.env
   needs:
     - job: pack-build
+      optional: true
+      artifacts: true
+    - job: native-dynatrace-build
+      optional: true
       artifacts: true
     - job: sonar
     - job: lint
     - job: test
     - job: gitleaks
-    - job: cooldown-scan
     - job: license-check-blocking
   rules:
     - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
     - if: $FORCE_DEV_DEPLOY == "true"
     - when: never
 
@@ -872,7 +884,7 @@ flux:
   script:
     - eval "CLUSTER_NAME=${LCL_GKE_CLUSTER_NAME}"
     - echo "LCL_NAMESPACE=${LCL_NAMESPACE}"
-    - APP_HEALTH_URL="https://${CLUSTER_NAME}.${LCL_CI_ENV}.gcp.lcl.gca/${NAMESPACE}/${CI_PROJECT_NAME}/api/1.0.0/health"
+    - APP_HEALTH_URL="https://${CLUSTER_NAME}.${LCL_CI_ENV}.gcp.lcl.gca/${NAMESPACE}/${CI_PROJECT_NAME}/actuator/health"
     - |
       echo "🔍 Waiting for deployment to complete..."
       echo "📦 Application: ${CI_PROJECT_NAME}"
@@ -1009,6 +1021,7 @@ flux:
   cache: {}
   rules:
     - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
     - if: $FORCE_DEV_DEPLOY == "true"
     - when: never
 
@@ -1017,46 +1030,49 @@ deployed-dev:
   needs:
     - job: pack-build
       optional: true
+    - job: native-dynatrace-build
+      optional: true
     - job: flux
   rules:
     - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
     - if: $FORCE_DEV_DEPLOY == "true"
     - when: never
 
 deployed-rec:
   extends: .deployed
   needs:
-    - promote-rec
-    # Hérite du dotenv FLUX_DIGEST (même digest de manifeste, préservé par gcrane copy)
-    - job: flux
-      artifacts: true
+  - promote-rec
+  # Hérite du dotenv FLUX_DIGEST (même digest de manifeste, préservé par gcrane copy)
+  - job: flux
+    artifacts: true
   tags:
-    - easypart-rec
+  - easypart-rec
   rules:
     - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 deployed-pprd:
   extends: .deployed
   needs:
-    - promote-pprd
-    - job: flux
-      artifacts: true
+  - promote-pprd
+  - job: flux
+    artifacts: true
   tags:
-    - easypart-pprd
+  - easypart-pprd
   rules:
-    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: on_success
 
 deployed-prd:
   extends: .deployed
   needs:
-    - promote-prd
-    - job: flux
-      artifacts: true
+  - promote-prd
+  - job: flux
+    artifacts: true
   tags:
-    - easypart-prd
+  - easypart-prd
   rules:
-    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: on_success
 
 .promote:
@@ -1064,11 +1080,12 @@ deployed-prd:
   variables:
     GIT_STRATEGY: none
   script:
-    - |-
-      if [ -n "${DIGEST}" ]
-      then gcrane copy europe-docker.pkg.dev/${GCP_PREV_PROJECT_ID}/docker/${CI_PROJECT_NAME}${DIGEST} europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker/${CI_PROJECT_NAME}:latest
-      fi
-    - gcrane copy
+  - |-
+    echo "🔄 Promoting image digest ${DIGEST} from ${GCP_PREV_PROJECT_ID} to ${GCP_PROJECT_ID}"
+    if [ -n "${DIGEST}" ]
+    then gcrane copy europe-docker.pkg.dev/${GCP_PREV_PROJECT_ID}/docker/${CI_PROJECT_NAME}${DIGEST} europe-docker.pkg.dev/${GCP_PROJECT_ID}/docker/${CI_PROJECT_NAME}:latest
+    fi
+  - gcrane copy
       europe-docker.pkg.dev/${GCP_PREV_PROJECT_ID}/oci-dev/${CI_PROJECT_NAME}${FLUX_DIGEST}
       europe-docker.pkg.dev/${GCP_PROJECT_ID}/oci-dev/${CI_PROJECT_NAME}:latest
   rules:
@@ -1082,14 +1099,17 @@ promote-rec:
     name: ${GCRANE_IMAGE}
     entrypoint: [""]
   needs:
-    - job: pack-build
-      optional: true
-      artifacts: true
-    - job: flux
-      artifacts: true
-    - deployed-dev
+  - job: pack-build
+    optional: true
+    artifacts: true
+  - job: native-dynatrace-build
+    optional: true
+    artifacts: true
+  - job: flux
+    artifacts: true
+  - deployed-dev
   tags:
-    - easypart-rec
+  - easypart-rec
 
 promote-pprd:
   extends: .promote
@@ -1102,17 +1122,20 @@ promote-pprd:
     name: pprd
     action: start
   needs:
-    - job: pack-build
-      optional: true
-      artifacts: true
-    - job: flux
-      artifacts: true
-    - job: trivy-scan
-    - deployed-rec
+  - job: pack-build
+    optional: true
+    artifacts: true
+  - job: native-dynatrace-build
+    optional: true
+    artifacts: true
+  - job: flux
+    artifacts: true
+  - job: trivy-scan
+  - deployed-rec
   tags:
-    - easypart-pprd
+  - easypart-pprd
   rules:
-    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: manual
 
 promote-prd:
@@ -1126,17 +1149,20 @@ promote-prd:
     name: prd
     action: start
   needs:
-    - job: pack-build
-      optional: true
-      artifacts: true
-    - job: flux
-      artifacts: true
-    - job: trivy-scan
-    - deployed-pprd
+  - job: pack-build
+    optional: true
+    artifacts: true
+  - job: native-dynatrace-build
+    optional: true
+    artifacts: true
+  - job: flux
+    artifacts: true
+  - job: trivy-scan
+  - deployed-pprd
   tags:
-    - easypart-prd
+  - easypart-prd
   rules:
-    - if: $CI_PIPELINE_SOURCE =~ /^(push|schedule|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|web)$/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: manual
 
 check-merge:
@@ -1152,6 +1178,17 @@ check-merge:
         if [ "$FORCE_DEV_DEPLOY" != "false" ]; then
           echo "❌ Merge request has not been approved - cannot merge : FORCE_DEV_DEPLOY is not set to false"
           exit 1
+        fi
+
+        echo "🔍 Native Image verification configuration..."
+        echo "📊 JAVA_NATIVE_BUILD actuel= ${JAVA_NATIVE_BUILD}"
+        if [ "${JAVA_NATIVE_BUILD}" = "false" ]; then
+          echo "⚠️  WARNING: JAVA_NATIVE_BUILD is set to 'false'"
+          echo "💡 This configuration is not allowed for a production deployment, but the pipeline will continue."
+          echo "🔧 Please set JAVA_NATIVE_BUILD=true to enable native compilation."
+        else
+          echo "✅ Native Image configuration validated: ${JAVA_NATIVE_BUILD}"
+          echo "🚀 The deployment is correctly using native compilation"
         fi
         
         echo "✅ Merge request is approved and can be merged"
