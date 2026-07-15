@@ -1,0 +1,23 @@
+stages:
+  - validation
+
+variables:
+  COMPONENT_FILES: "back/.gitlab-ci.yml bff/.gitlab-ci.yml"
+
+check-component:
+  stage: validation
+  allow_failure: false
+  script:
+    - echo "📁 Vérification de la présence des fichiers requis"
+    - REQUIRED_FILES="$COMPONENT_FILES readme.md"
+    - |
+      for file in $REQUIRED_FILES; do
+        if [ ! -f "$file" ]; then
+          echo "❌ Fichier manquant : $file"
+          exit 1
+        else
+          echo "✅ Fichier présent : $file"
+        fi
+      done
+
+    - echo "🎉 Tous les fichiers requis sont présents"
