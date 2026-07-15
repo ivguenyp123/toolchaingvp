@@ -1,0 +1,53 @@
+# trivy-license.yaml — Politique de conformité des licences OSS (ACDC-859)
+#
+# Chargé UNIQUEMENT par les jobs license-check-* via TRIVY_CONFIG, pour ne pas
+# interférer avec le scan d'image de vulnérabilités (job trivy-scan).
+# ⚠️ Ne pas renommer en "trivy.yaml" : Trivy le chargerait automatiquement pour
+#    tous les jobs Trivy et transformerait le scan d'image en scan de licences.
+#
+# Mapping catégorie -> sévérité (défaut Trivy, utilisé par le gate --severity) :
+#   forbidden   -> CRITICAL  (bloquant sur la branche par défaut)
+#   restricted  -> HIGH      (tracé, non bloquant : copyleft faible)
+#   reciprocal  -> MEDIUM
+#   notice      -> LOW
+#   permissive  -> LOW
+#   unencumbered-> LOW
+scan:
+  scanners:
+    - license
+
+license:
+  # Analyse fine : inspecte aussi les en-têtes de fichiers, pas juste les manifestes
+  full: true
+
+  # Copyleft fort -> incompatible avec un usage commercial fermé (contamination).
+  # AGPL : divulgation déclenchée dès l'interaction réseau (SaaS), motif central
+  # du bannissement en contexte bancaire.
+  forbidden:
+    - GPL-2.0-only
+    - GPL-2.0-or-later
+    - GPL-3.0-only
+    - GPL-3.0-or-later
+    - AGPL-3.0-only
+    - AGPL-3.0-or-later
+    - SSPL-1.0
+    - EUPL-1.1
+    - EUPL-1.2
+
+  # Copyleft faible -> compatible sous conditions (linking dynamique / par fichier).
+  # Tracé (HIGH) mais non bloquant.
+  restricted:
+    - LGPL-2.1-only
+    - LGPL-3.0-only
+    - MPL-2.0
+    - EPL-1.0
+    - EPL-2.0
+    - CDDL-1.0
+
+  # Permissives explicitement autorisées.
+  permissive:
+    - MIT
+    - Apache-2.0
+    - BSD-2-Clause
+    - BSD-3-Clause
+    - ISC
